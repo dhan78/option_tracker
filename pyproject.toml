@@ -1,0 +1,29 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "option-tracker"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dash>=3.2.0",
+    "dash-bootstrap-components>=2.0.3",
+    "requests-cache>=1.2.1",
+    "scikit-learn>=1.7.1",
+    "simplejson>=3.20.1",
+    "yfinance>=0.2.65",
+]
+
+[project.scripts]
+option-tracker = "option_tracker.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["option_tracker*"]
+namespaces = true
