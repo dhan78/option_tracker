@@ -460,7 +460,7 @@ wheels = [
 [[package]]
 name = "option-tracker"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "dash" },
     { name = "dash-bootstrap-components" },

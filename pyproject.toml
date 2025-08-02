@@ -26,4 +26,3 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["option_tracker*"]
-namespaces = true
