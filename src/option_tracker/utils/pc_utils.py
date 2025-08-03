@@ -68,19 +68,55 @@ def isNowInTimePeriod(startTime, endTime, nowTime):
         return nowTime >= startTime or nowTime <= endTime
 class DB():
     def __init__(self,db_file):
-        self.db_file=db_file
+        self.db_file = db_file
         PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
         self.DB_PATH = os.path.join(PROJECT_ROOT, self.db_file)
-        # self.conn = self.create_connection(DB_PATH)
+        # Ensure data directory exists
+        os.makedirs(os.path.dirname(self.DB_PATH), exist_ok=True)
 
     def create_connection(self):
         conn = None
         try:
             conn = sqlite3.connect(self.DB_PATH)
-        except:
-            e = sys.exc_info()[1]
+            # Create tables if they don't exist
+            self._create_tables(conn)
+        except Error as e:
+            print(f"Error connecting to database: {e}")
             print(traceback.print_exc())
         return conn
+
+    def _create_tables(self, conn):
+        """Create necessary tables if they don't exist"""
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tsla_nasdaq (
+                    load_dt TEXT,
+                    load_tm TEXT,
+                    expiryDate TEXT,
+                    strike REAL,
+                    c_Last REAL,
+                    p_Last REAL,
+                    c_Change REAL,
+                    p_Change REAL,
+                    c_Volume INTEGER,
+                    p_Volume INTEGER,
+                    c_Openinterest INTEGER,
+                    p_Openinterest INTEGER,
+                    tsla_spot_price REAL,
+                    PRIMARY KEY (load_dt, load_tm, expiryDate, strike)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS mmtm_daily (
+                    load_dt TEXT PRIMARY KEY,
+                    data TEXT
+                )
+            ''')
+            conn.commit()
+        except Error as e:
+            print(f"Error creating tables: {e}")
+            print(traceback.print_exc())
 
     def store_data(self,p_df, p_load_dt):
         # import pdb; pdb.set_trace()

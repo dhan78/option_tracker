@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
 
 # Distribution / packaging
 dist/
