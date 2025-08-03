@@ -16,7 +16,7 @@ dash.register_page(__name__, path='/display_option_chain',
 
 
 def get_leap_fig_and_nl():
-    from utils.pc_utils import Nasdaq_Leap
+    from option_tracker.utils.pc_utils import Nasdaq_Leap
     NL = Nasdaq_Leap()
     fig = NL.buil_leap_fig()
     return NL, fig
