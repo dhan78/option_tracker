@@ -2,6 +2,11 @@
 JPMorgan Workspace Login Automation Module.
 Handles automated login and ICA client launch for JPM Workspace.
 """
+# /// script
+# dependencies = [
+#   "selenium>=4.34.2"
+# ]
+# ///
 
 import os
 import subprocess
