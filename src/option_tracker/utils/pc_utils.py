@@ -6,8 +6,8 @@ import traceback
 from sqlite3 import Error
 import datetime as dt
 import os
-os.environ["http_proxy"]='http://approxy.jpmchase.net:8080'
-os.environ["https_proxy"]='http://approxy.jpmchase.net:8080' 
+# os.environ["http_proxy"]='http://approxy.jpmchase.net:8080'
+# os.environ["https_proxy"]='http://approxy.jpmchase.net:8080' 
 
 import requests_cache
 #import requests_cache
