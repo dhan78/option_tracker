@@ -6,8 +6,28 @@ import traceback
 from sqlite3 import Error
 import datetime as dt
 import os
-# os.environ["http_proxy"]='http://approxy.jpmchase.net:8080'
-# os.environ["https_proxy"]='http://approxy.jpmchase.net:8080' 
+import socket
+def get_host_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+host_ip = get_host_ip()
+print(f"Detected Host IP: {host_ip}")
+if not host_ip.startswith("192.168."):
+    os.environ["http_proxy"] = 'http://approxy.jpmchase.net:8080'
+    os.environ["https_proxy"] = 'http://approxy.jpmchase.net:8080'
+    print("Proxy enabled.")
+else:
+    os.environ.pop("http_proxy", None)
+    os.environ.pop("https_proxy", None)
+    print("Proxy disabled.")
 
 import requests_cache
 #import requests_cache
