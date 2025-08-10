@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.pyc
@@ -7,6 +8,7 @@ __pycache__/
 *.pyd
 .Python
 *.so
+
 
 # Distribution / packaging
 dist/
