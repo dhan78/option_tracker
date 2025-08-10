@@ -1,81 +1,94 @@
-import pathlib
-from datetime import datetime
-import sqlite3
-import sys
-import traceback
-from sqlite3 import Error
-import datetime as dt
 import os
+import re
+import sys
+import time
+import random
 import socket
-def get_host_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
+import pathlib
+import sqlite3
+import traceback
+from enum import Enum, auto
+from datetime import datetime, timedelta
+import dateutil.parser as dparse
 
-host_ip = get_host_ip()
-print(f"Detected Host IP: {host_ip}")
-if not host_ip.startswith("192.168."):
-    os.environ["http_proxy"] = 'http://approxy.jpmchase.net:8080'
-    os.environ["https_proxy"] = 'http://approxy.jpmchase.net:8080'
-    print("Proxy enabled.")
-else:
-    os.environ.pop("http_proxy", None)
-    os.environ.pop("https_proxy", None)
-    print("Proxy disabled.")
-
+# === Third-Party Imports ===
+import requests
 import requests_cache
-#import requests_cache
-# import requests_cache
-# import requests_cache
 import yfinance as yf
 import numpy as np
+import pandas as pd
+import simplejson as json
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler, MinMaxScaler
-import requests
-import os
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import simplejson as json
-import re
-#import requests_cache
-import random
-import pandas as pd
-from enum import Enum, auto
-import time
 
-# os.environ["http_proxy"]='http://proxy.jpmchase.net:8080'
-# os.environ["https_proxy"]='http://proxy.jpmchase.net:8443'
+# === Database Error Import ===
+from sqlite3 import Error
+
+
+# ---------------------------
+# Utility Functions
+# ---------------------------
+
+def get_host_ip():
+    """Get the primary non-loopback IPv4 address of the host."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't actually connect to internet
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def configure_proxy():
+    """Enable or disable proxy based on host IP."""
+    host_ip = get_host_ip()
+    print(f"Detected Host IP: {host_ip}")
+
+    if not host_ip.startswith("192.168."):
+        os.environ["http_proxy"] = "http://approxy.jpmchase.net:8080"
+        os.environ["https_proxy"] = "http://approxy.jpmchase.net:8080"
+        print("Proxy enabled.")
+    else:
+        os.environ.pop("http_proxy", None)
+        os.environ.pop("https_proxy", None)
+        print("Proxy disabled.")
 
 
 def get_yahoo_session():
-    session = requests_cache.CachedSession('yfinance.cache')
-    session.headers['User-agent'] = 'my-x1carbon/1.02' + str(random.random())
+    """Create a cached Yahoo Finance session with a randomized User-Agent."""
+    session = requests_cache.CachedSession("yfinance.cache")
+    session.headers["User-agent"] = f"my-x1carbon/1.02{random.random()}"
     return session
 
 
+# ---------------------------
+# Initialization
+# ---------------------------
+
+configure_proxy()
+
+# Enum example
 class OIC_State(Enum):
     IDLE = auto()
     RUNNING = auto()
 
-
-import dateutil.parser as dparse
-from datetime import timedelta
-
+# Date Calculations
 next_friday = dparse.parse("Friday")
 next_monday = dparse.parse("Monday")
 one_week = timedelta(days=7)
+
 weekly_expiry_target = next_friday + one_week * 6
-run_dt_yyyy_mm_dd = datetime.today().strftime('%Y-%m-%d')
-prev_friday=next_friday - one_week
-prev_monday=next_monday - one_week
-prev_friday_yyyy_mm_dd=prev_friday.strftime('%Y-%m-%d')
+run_dt_yyyy_mm_dd = datetime.today().strftime("%Y-%m-%d")
+
+prev_friday = next_friday - one_week
+prev_monday = next_monday - one_week
+
+prev_friday_yyyy_mm_dd = prev_friday.strftime("%Y-%m-%d")
 
 
 
