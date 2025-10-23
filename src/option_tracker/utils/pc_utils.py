@@ -45,14 +45,40 @@ def get_host_ip():
 
 
 def configure_proxy():
-    """Enable or disable proxy based on host IP."""
+    """Enable or disable proxy based on host reachability (ping, then TCP fallback)."""
     host_ip = get_host_ip()
     print(f"Detected Host IP: {host_ip}")
 
-    if not host_ip.startswith("192.168."):
-        os.environ["http_proxy"] = "http://approxy.jpmchase.net:8080"
-        os.environ["https_proxy"] = "http://approxy.jpmchase.net:8080"
-        print("Proxy enabled.")
+    proxy_host = "approxy.jpmchase.net"
+    proxy_port = 8080
+    reachable = False
+
+    # Try system ping if available
+    try:
+        import shutil, subprocess
+        ping_cmd = shutil.which("ping")
+        if ping_cmd:
+            try:
+                res = subprocess.run([ping_cmd, "-c", "1", proxy_host],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                reachable = (res.returncode == 0)
+            except Exception:
+                reachable = False
+    except Exception:
+        reachable = False
+
+    # Fallback: try TCP connect
+    if not reachable:
+        try:
+            with socket.create_connection((proxy_host, proxy_port), timeout=3):
+                reachable = True
+        except Exception:
+            reachable = False
+
+    if reachable:
+        os.environ["http_proxy"] = f"http://{proxy_host}:{proxy_port}"
+        os.environ["https_proxy"] = f"http://{proxy_host}:{proxy_port}"
+        print(f"Proxy enabled: {proxy_host}:{proxy_port}")
     else:
         os.environ.pop("http_proxy", None)
         os.environ.pop("https_proxy", None)
