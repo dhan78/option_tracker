@@ -136,6 +136,7 @@ def display_click_data(target_closing_price, clickData, n_intervals, n_clicks, s
                 'showOptionHistory'), toggle_display('ReplayHistory'), dash.no_update
         elif ctx.triggered[0]['prop_id'] in ['.',
                                              'interval-component.n_intervals']:  # triggered by inital_load ('.') or timer
+            # return dash.no_update , dash.no_update ,dash.no_update ,dash.no_update ,dash.no_update ,dash.no_update 
             tickr.get_lastSalePrice()
             # if tickr.state == OIC_State.RUNNING:
             print(f'Previous call status: {tickr.state}')

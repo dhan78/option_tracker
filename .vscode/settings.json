@@ -1,5 +1,6 @@
 {
     "python.analysis.extraPaths": [
         "./src/option_tracker"
-    ]
+    ],
+    "python-envs.pythonProjects": []
 }

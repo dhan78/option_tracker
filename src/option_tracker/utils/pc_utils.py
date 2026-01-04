@@ -23,11 +23,14 @@ from plotly.subplots import make_subplots
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler, MinMaxScaler
+from scipy.stats import norm
+from scipy.optimize import brentq
 
 # === Database Error Import ===
 from sqlite3 import Error
-
-
+# import debugpy
+# debugpy.listen(5678)
+# debugpy.wait_for_client()
 # ---------------------------
 # Utility Functions
 # ---------------------------
@@ -380,6 +383,8 @@ class Ticker():
         self.df, self.fig = None, None
         self.dict_target={}
         self.state = OIC_State.IDLE
+        self.atm_iv_by_expiry = {}  # Store ATM IV for each expiry date
+        self.prev_busday_close_price = None  # Previous business day closing price
 
     def set_state(self, state:OIC_State):
         self.state = state
@@ -389,9 +394,18 @@ class Ticker():
         # url = 'https://api.nasdaq.com/api/quote/TSLA/realtime-trades?&limit=10&fromTime=00:00'
         response = requests.get(url, headers=get_headers())
         lastSalePrice = response.json()['data']['primaryData']['lastSalePrice']
+        netChange = response.json()['data']['primaryData']['netChange']
         self.marketStatus = response.json()['data']['marketStatus']
 
         self.lastSalePrice = float(re.findall("\d+\.\d+", lastSalePrice)[0])
+        
+        # Calculate previous business day closing price: Last Sale Price - Net Change
+        try:
+            netChange_float = float(netChange.replace(',', ''))
+            self.prev_busday_close_price = self.lastSalePrice - netChange_float
+        except (ValueError, AttributeError):
+            self.prev_busday_close_price = None
+        
         return lastSalePrice
 
     def get_prevBusDay(self):
@@ -405,6 +419,121 @@ class Ticker():
             response = requests.get(url, headers=get_headers())
             self.lastBusDay_yyyy_mm_dd = pd.to_datetime(response.json()['data']['secondaryData']['lastTradeTimestamp'].split('ON')[1]).strftime(
                 '%Y-%m-%d')
+
+    def calculate_implied_volatility(self, option_price, stock_price, strike, time_to_expiry, risk_free_rate=0.05, option_type='call'):
+        """
+        Calculate implied volatility using Black-Scholes model via Brent's method.
+        
+        Args:
+            option_price: Current market price of the option
+            stock_price: Current stock price
+            strike: Strike price
+            time_to_expiry: Time to expiration in years (days/365)
+            risk_free_rate: Risk-free rate (default 5%)
+            option_type: 'call' or 'put'
+        
+        Returns:
+            float: Implied volatility (annualized), or None if calculation fails
+        """
+        
+        def black_scholes_price(volatility):
+            """Black-Scholes pricing formula"""
+            if volatility <= 0 or time_to_expiry <= 0:
+                return 0
+            
+            d1 = (np.log(stock_price / strike) + (risk_free_rate + 0.5 * volatility**2) * time_to_expiry) / (volatility * np.sqrt(time_to_expiry))
+            d2 = d1 - volatility * np.sqrt(time_to_expiry)
+            
+            if option_type == 'call':
+                price = stock_price * norm.cdf(d1) - strike * np.exp(-risk_free_rate * time_to_expiry) * norm.cdf(d2)
+            else:  # put
+                price = strike * np.exp(-risk_free_rate * time_to_expiry) * norm.cdf(-d2) - stock_price * norm.cdf(-d1)
+            
+            return price
+        
+        def objective_function(volatility):
+            """Function to minimize: difference between market and model price"""
+            return black_scholes_price(volatility) - option_price
+        
+        try:
+            # Use Brent's method to find volatility that matches option price
+            # Search between 0.01 (1%) and 5.0 (500%) volatility
+            implied_vol = brentq(objective_function, 0.01, 5.0, xtol=1e-6, maxiter=100)
+            return implied_vol
+        except (ValueError, RuntimeError):
+            # Failed to converge or invalid inputs
+            return None
+
+    def add_implied_volatility_columns(self, expirydt, df_expiry):
+        """
+        Add current IV columns to dataframe for calls and puts.
+        
+        Calculates implied volatility based on current option prices using Black-Scholes.
+        Shows IV smile/skew across strikes.
+        
+        Args:
+            df_expiry: DataFrame with columns: strike, expirygroup, c_Last, p_Last
+        
+        Returns:
+            DataFrame with added columns: c_IV, p_IV, c_IV_%, p_IV_%
+        """
+        
+        # Make a copy to avoid SettingWithCopyWarning
+        df_expiry = df_expiry.copy()
+        
+        # Get expiry date and calculate time to expiry
+        # expirydt can be a string, datetime, or Timestamp
+        if isinstance(expirydt, str):
+            expiry_date = pd.to_datetime(expirydt, format='%b-%d-%Y')
+        else:
+            expiry_date = pd.to_datetime(expirydt)
+        
+        days_to_expiry = (expiry_date - datetime.today()).days
+        time_to_expiry = max(days_to_expiry / 365.0, 0.001)  # Minimum 0.001 to avoid division by zero
+        
+        # Get current stock price
+        stock_price = self.lastSalePrice
+        
+        # Initialize IV columns with None
+        df_expiry['c_IV'] = None
+        df_expiry['p_IV'] = None
+        
+        # Calculate IV for each row
+        for idx in df_expiry.index:
+            try:
+                strike = df_expiry.loc[idx, 'strike']
+                
+                # Calculate current call IV
+                if df_expiry.loc[idx, 'c_Last'] > 0.1:
+                    c_iv = self.calculate_implied_volatility(
+                        df_expiry.loc[idx, 'c_Last'], 
+                        stock_price, 
+                        strike, 
+                        time_to_expiry, 
+                        option_type='call'
+                    )
+                    df_expiry.loc[idx, 'c_IV'] = c_iv
+                
+                # Calculate current put IV
+                if df_expiry.loc[idx, 'p_Last'] > 0.1:
+                    p_iv = self.calculate_implied_volatility(
+                        df_expiry.loc[idx, 'p_Last'], 
+                        stock_price, 
+                        strike, 
+                        time_to_expiry, 
+                        option_type='put'
+                    )
+                    df_expiry.loc[idx, 'p_IV'] = p_iv
+            
+            except Exception as e:
+                # Skip this row if calculation fails
+                continue
+        
+        # Convert to percentage for display (rounded to 2 decimals)
+        df_expiry['c_IV_%'] = (df_expiry['c_IV'] * 100).astype(float).round(2)
+        df_expiry['p_IV_%'] = (df_expiry['p_IV'] * 100).astype(float).round(2)
+        
+        return df_expiry
 
 
 # prev_bus_day_closing price: https://api.nasdaq.com/api/quote/TSLA/historical?assetclass=stocks&fromdate=2021-06-06&limit=1&todate=2021-07-06
@@ -486,7 +615,7 @@ class Ticker():
                             specs=[[{"secondary_y": True}, {"secondary_y": True}]] * num_or_charts)
         y_max = df.filter(regex='Openinterest').apply(pd.to_numeric, errors='coerce').max(axis=1).max()*1.1
         for i, expiry in enumerate(df.sort_values(by=['expirygroup']).groupby(['expirygroup'])):
-            expirydt = expiry[0][0].strftime('%B-%d-%Y') if not isinstance(expiry[0], str) else expiry[0]
+            expirydt = expiry[0][0].strftime('%b-%d-%Y') if not isinstance(expiry[0], str) else expiry[0]
             df_expiry = expiry[1]
             # df_expiry = df_expiry.filter(regex='c_|p_|strike').apply(pd.to_numeric, errors='coerce')
             df_expiry.sort_values(by='strike', inplace=True)
@@ -576,13 +705,13 @@ class Ticker():
 
         for i, expiry in enumerate(df.sort_values(by=['expirygroup']).groupby(['expirygroup'])):
             fig.update_xaxes(row=i + 1, col=1, dtick=2.5, tickangle=-60)
-            title_text = expiry[0][0] if isinstance(expiry[0], str) else expiry[0][0].strftime('%B-%d-%Y')
+            title_text = expiry[0][0] if isinstance(expiry[0], str) else expiry[0][0].strftime('%b-%d-%Y')
             fig.update_yaxes(title_text=title_text, range=[0, y_max], row=i + 1, col=1, secondary_y=False)
             fig.update_yaxes(range=[0, 100000], row=i + 1, col=1, secondary_y=True)
             fig.add_vline(x=lastSalePrice, line_dash='dash', line_color='black', line_width=.6, row=i + 1, col=1)
 
         for i, expiry in enumerate(df.sort_values(by=['expirygroup']).groupby(['expirygroup'])):
-            expirydt = expiry[0] if isinstance(expiry[0], str) else expiry[0][0].strftime('%B-%d-%Y')
+            expirydt = expiry[0] if isinstance(expiry[0], str) else expiry[0][0].strftime('%b-%d-%Y')
             df_expiry = expiry[1]
             df_expiry = df_expiry.filter(regex='c_|p_|strike').apply(pd.to_numeric, errors='coerce')
             df_expiry.sort_values(by=['strike'], inplace=True)
@@ -590,6 +719,10 @@ class Ticker():
             df_expiry['p_%'] = df_expiry.p_Change * 100 / (df_expiry.p_Last - df_expiry.p_Change)
             df_expiry['c_1'] = df_expiry.c_Last - df_expiry.c_Change
             df_expiry['p_1'] = df_expiry.p_Last - df_expiry.p_Change
+            
+            # Calculate implied volatility (pass raw expiry date object)
+            expiry_date_obj = expiry[0] if isinstance(expiry[0], str) else expiry[0][0]
+            df_expiry = self.add_implied_volatility_columns(expiry_date_obj, df_expiry)
 
             # Call price Change (Theta decay)
             # fig.append_trace(go.Bar(x=df_expiry.strike.values, y=df_expiry['c_Change'].values, hovertemplate='%{y:.2f}', name='C Decay' + expirydt, marker_color='rgb(0,150,0)', opacity=.8, width=.3), row=i + 1, col=2)
@@ -613,8 +746,123 @@ class Ticker():
                 go.Scatter(x=df_expiry.strike.values, y=df_expiry.p_1.values, name='P-1 ' + expirydt, mode='lines',
                            line_shape='spline', marker_color='rgb(350,0,0)', opacity=.8,
                            line=dict(color='rgb(255,0,0)', width=1, dash='dot')), row=i + 1, col=2)
+            
+            # Call IV (Implied Volatility)
+            if 'c_IV_%' in df_expiry.columns:
+                fig.add_trace(
+                    go.Scatter(x=df_expiry.strike.values, y=df_expiry['c_IV_%'].values, name='C-IV% ' + expirydt, 
+                               mode='lines', line_shape='spline', marker_color='rgb(0,200,200)', opacity=.6,
+                               line=dict(color='rgb(0,200,200)', width=2)), row=i + 1, col=2, secondary_y=True)
+            
+            # Put IV (Implied Volatility)
+            if 'p_IV_%' in df_expiry.columns:
+                fig.add_trace(
+                    go.Scatter(x=df_expiry.strike.values, y=df_expiry['p_IV_%'].values, name='P-IV% ' + expirydt, 
+                               mode='lines', line_shape='spline', marker_color='rgb(255,165,0)', opacity=.6,
+                               line=dict(color='rgb(255,165,0)', width=2)), row=i + 1, col=2, secondary_y=True)
+
+            # Find IV at ATM (At-The-Money) strike closest to current price
+            if 'c_IV_%' in df_expiry.columns and df_expiry['c_IV_%'].notna().any():
+                # Find strike closest to lastSalePrice
+                atm_idx = (df_expiry['strike'] - lastSalePrice).abs().idxmin()
+                atm_strike = df_expiry.loc[atm_idx, 'strike']
+                atm_call_iv = df_expiry.loc[atm_idx, 'c_IV_%']
+                atm_put_iv = df_expiry.loc[atm_idx, 'p_IV_%']
+                
+                # Calculate average IV (industry standard)
+                atm_iv_avg = (atm_call_iv + atm_put_iv) / 2
+                
+                # Store in class variable for access outside method
+                self.atm_iv_by_expiry[expirydt] = {
+                    'strike': atm_strike,
+                    'call_iv': atm_call_iv,
+                    'put_iv': atm_put_iv,
+                    'avg_iv': atm_iv_avg,  # Industry standard ATM IV
+                    'call_price': df_expiry.loc[atm_idx, 'c_Last'],
+                    'put_price': df_expiry.loc[atm_idx, 'p_Last'],
+                    'call_oi': df_expiry.loc[atm_idx, 'c_Openinterest'],
+                    'put_oi': df_expiry.loc[atm_idx, 'p_Openinterest']
+                }
+                
+                # Print to console
+                # print(f"\n{expirydt} ATM IV @ ${atm_strike:.2f}:")
+                # print(f"  Call IV: {atm_call_iv:.2f}%")
+                # print(f"  Put IV: {atm_put_iv:.2f}%")
+                # print(f"  Average IV: {atm_iv_avg:.2f}% ★")  # Highlight the standard metric
+                
+                # Add text annotation on chart showing average ATM IV
+                fig.add_trace(go.Scatter(
+                    x=[lastSalePrice + 2.5],  # Offset slightly right of vline
+                    y=[atm_iv_avg + 5],  # Position using average IV
+                    text=[f"ATM IV: {atm_iv_avg:.1f}%"],
+                    name="ATM_IV_" + expirydt,
+                    mode="text",
+                    opacity=0.8,
+                    textfont=dict(
+                        size=10,
+                        color="purple"
+                    )
+                ), row=i + 1, col=2, secondary_y=True)
 
             fig.add_vline(x=lastSalePrice, line_dash='dash', line_color='black', line_width=.6, row=i + 1, col=2)
+            
+            # Calculate 2-sigma expected move using ATM IV
+            if expirydt in self.atm_iv_by_expiry:
+                atm_iv_decimal = self.atm_iv_by_expiry[expirydt]['avg_iv'] / 100
+                
+                # Get expiry date from the grouped data
+                expiry_date = expiry[0] if isinstance(expiry[0], str) else expiry[0][0]
+                if isinstance(expiry_date, str):
+                    expiry_date = pd.to_datetime(expiry_date, format='%b-%d-%Y')
+                
+                days_to_expiry = (expiry_date - datetime.today()).days
+                time_factor = np.sqrt(max(days_to_expiry, 1) / 365)  # Avoid division by zero
+                
+                # 2-sigma expected move (95% confidence interval)
+                two_sigma_move = self.lastSalePrice * atm_iv_decimal * time_factor * 2
+                
+                # Calculate upper and lower bounds
+                upper_2sigma = self.lastSalePrice + two_sigma_move
+                lower_2sigma = self.lastSalePrice - two_sigma_move
+                
+                # Store in class variable for later use
+                self.atm_iv_by_expiry[expirydt]['upper_2sigma'] = upper_2sigma
+                self.atm_iv_by_expiry[expirydt]['lower_2sigma'] = lower_2sigma
+                self.atm_iv_by_expiry[expirydt]['two_sigma_move'] = two_sigma_move
+                
+                # Plot upper 2-sigma line (orange)
+                fig.add_vline(x=upper_2sigma, line_dash='dash', line_color='orange', 
+                              line_width=.8, row=i + 1, col=1)
+                
+                # Plot lower 2-sigma line (orange)
+                fig.add_vline(x=lower_2sigma, line_dash='dash', line_color='orange', 
+                              line_width=.8, row=i + 1, col=1)
+                
+                # Add text annotations for 2-sigma strikes
+                fig.add_trace(go.Scatter(
+                    x=[upper_2sigma],
+                    y=[55 - i * 5],
+                    text=[f"+2σ: ${upper_2sigma:.2f}"],
+                    mode="text",
+                    name=f"2sigma_upper_{expirydt}",
+                    opacity=0.7,
+                    textfont=dict(size=9, color="orange")
+                ), row=i + 1, col=1)
+                
+                fig.add_trace(go.Scatter(
+                    x=[lower_2sigma],
+                    y=[55 - i * 5],
+                    text=[f"-2σ: ${lower_2sigma:.2f}"],
+                    mode="text",
+                    name=f"2sigma_lower_{expirydt}",
+                    opacity=0.7,
+                    textfont=dict(size=9, color="orange")
+                ), row=i + 1, col=1)
+                
+                # Print to console
+                print(f"{expirydt} - 2σ Range: ${lower_2sigma:.2f} to ${upper_2sigma:.2f} "
+                      f"(±${two_sigma_move:.2f} or ±{atm_iv_decimal*100*time_factor*2:.1f}%)")
+
             # Current price
             fig.add_trace(go.Scatter(
                 x=[lastSalePrice],
@@ -631,7 +879,7 @@ class Ticker():
 
         for i, expiry in enumerate(df.sort_values(by=['expirygroup']).groupby(['expirygroup'])):
             fig.update_xaxes(row=i + 1, col=2, dtick=2.5, tickangle=-60)
-            title_text = expiry[0] if isinstance(expiry[0], str) else expiry[0][0].strftime('%B-%d-%Y')
+            title_text = expiry[0] if isinstance(expiry[0], str) else expiry[0][0].strftime('%b-%d-%Y')
             fig.update_yaxes(title_text=title_text, range=[0, 60], row=i + 1, col=2)  # ,ticksuffix="%")
 
         fig.update_layout(
