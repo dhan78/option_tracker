@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Options Pulse · Option Chain</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/app.css" />
+  <script src="https://code.highcharts.com/highcharts.js"></script>
+  <script src="https://code.highcharts.com/highcharts-more.js"></script>
+  <script src="https://code.highcharts.com/modules/heatmap.js"></script>
+  <script src="https://code.highcharts.com/modules/exporting.js"></script>
+</head>
+<body>
+  <nav class="navbar">
+    <span class="brand"><img class="brand-icon" src="/static/favicon.svg" alt="" />Options Pulse</span>
+    <a href="/" class="active">PUT CALL Option Chain</a>
+    <a href="/leap">LEAP Options</a>
+  </nav>
+
+  <div class="status-bar" id="status-bar">
+    <span class="muted"><span class="spinner"></span>Loading option chain…</span>
+  </div>
+  <div id="refresh-label" class="muted"></div>
+  <div class="calc-link-row"><a href="#" id="calc-link">Show 2σ &amp; probability of expiring calculations →</a></div>
+
+  <div class="content">
+    <details id="spot-panel" class="collapsible" open>
+      <summary>TSLA Spot (intraday)</summary>
+      <div class="spot-controls">Live refresh:
+        <select id="spot-interval">
+          <option value="3">3s</option>
+          <option value="5" selected>5s</option>
+          <option value="10">10s</option>
+          <option value="30">30s</option>
+          <option value="60">60s</option>
+        </select>
+      </div>
+      <div id="spot-chart" class="chart-box" style="min-height:220px;"></div>
+    </details>
+    <details id="iv-panel" class="collapsible" open>
+      <summary>IV Surface &amp; Smile</summary>
+      <div class="iv-row">
+        <div id="iv-heatmap" class="chart-box" style="min-height:260px;"></div>
+        <div id="iv-smile" class="chart-box" style="min-height:260px;"></div>
+      </div>
+    </details>
+    <details id="gex-panel" class="collapsible" open>
+      <summary>Dealer Gamma (GEX) <span id="gex-badge" class="gex-badge"></span> <span id="charm-badge" class="charm-badge"></span></summary>
+      <div id="gex-chart" class="chart-box" style="min-height:300px;"></div>
+      <div id="gex-curve" class="chart-box" style="min-height:240px;"></div>
+      <div class="gex-note">Top: net dealer gamma per strike ($mm per 1% move). Bottom: total GEX as spot itself moves — the <b>dome above the flip = long gamma</b> (dips bought, vol suppressed, pins to walls); the <b>dip below = short gamma</b> (dips sold, moves amplified). Convention: dealers long calls / short puts; T-1 open interest.</div>
+      <div id="charm-chart" class="chart-box" style="min-height:240px;"></div>
+      <div class="charm-note"><b>Charm</b> = delta decay between now and today's 4pm close, with spot &amp; IV held fixed. As theta bleeds, option deltas drift and dealers must re-hedge: <b>green bars = they buy</b> (upward pull toward that strike), <b>red = they sell</b>. The badge sums it — a positive $mm total is the mechanical <b>into-close pin drift up</b>. Strongest near expiring OTM strikes; fades to zero at the bell.</div>
+    </details>
+    <details id="wheel-panel" class="collapsible" open>
+      <summary>Wheel Scanner <span class="muted" id="wheel-count"></span></summary>
+      <div class="wheel-controls">
+        Side <select id="w-side"><option value="all">All</option><option value="CSP">CSP · sell puts</option><option value="CC">CC · sell calls</option></select>
+        &nbsp;·&nbsp; min PoP <input id="w-pop" type="number" value="0" min="0" max="100" step="5" /> %
+        &nbsp;·&nbsp; DTE <input id="w-mindte" type="number" value="1" min="0" /> – <input id="w-maxdte" type="number" value="60" min="0" />
+      </div>
+      <div class="wheel-note">Selling OTM cash-secured puts (CSP) &amp; covered calls (CC). Δ ≈ assignment probability · PoP = keep-the-premium odds · <b>Ann ROC</b> = bid ÷ (strike for CSP, spot for CC) annualized by DTE · Breakeven = assigned cost basis (CSP) or effective sale price (CC) · ⚠ = strike beyond the 2σ expected move. Rows shaded near the 0.30 / 0.16 delta targets. Click a header to sort. Per-expiry yield ladders appear beside each expiry row below.</div>
+      <div class="calc-link-row"><a href="#" id="ladder-help-link">How to read the yield ladder (ann ROC%) →</a></div>
+      <div id="wheel-table"></div>
+    </details>
+    <div id="charts"></div>
+  </div>
+
+  <script src="/static/option_chain.js"></script>
+</body>
+</html>
