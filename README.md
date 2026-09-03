@@ -43,13 +43,12 @@ uvx --from I:\option-tracker option-tracker
 
 From the project root:
 
-```bash
-cd /var/home/admin/IdeaProjects/option_tracker
+```cmd
 uv sync
-uv run option-tracker-web
+uv run option-tracker
 ```
 
-This starts the FastAPI dashboard. Open your browser at:
+Either option starts the Dash server. Open your browser at:
 
 - http://localhost:8050
 

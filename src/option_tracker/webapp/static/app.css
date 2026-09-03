@@ -49,6 +49,11 @@ body {
 
 .content { padding: 12px 18px 40px; }
 
+/* Two-column dashboard: price + dealer positioning (left) · vol + income (right). */
+.board { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+.board-col { display: flex; flex-direction: column; min-width: 0; }
+@media (max-width: 1100px) { .board { grid-template-columns: 1fr; } }
+
 .expiry-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -72,7 +77,7 @@ body {
 .loading { padding: 30px; color: #667; }
 .error { padding: 20px; color: var(--put); font-weight: 600; }
 
-.iv-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+.iv-row { display: grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }
 .iv-row .collapsible { margin-bottom: 14px; }
 
 .collapsible { background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; margin-bottom: 14px; }
@@ -83,16 +88,17 @@ body {
 .collapsible .chart-box { border: none; }
 .spot-controls { padding: 4px 12px 0; font-size: 12px; color: #667; }
 .spot-controls select { font-size: 12px; margin-left: 4px; }
-#spot-panel { max-width: 50%; }
-#gex-panel { max-width: 50%; }
-#wheel-panel { max-width: 50%; }
 .gex-badge { font-weight: 600; font-size: 12px; margin-left: 8px; padding: 2px 8px; border-radius: 10px; }
 .gex-badge.long { background: #e7f6ec; color: #1a7f37; }
 .gex-badge.short { background: #fdeaea; color: #b40426; }
 .gex-note { padding: 2px 12px 10px; font-size: 11px; color: #667; }
+.gex-controls { padding: 6px 12px 2px; font-size: 12px; color: #667; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gex-controls input[type=range] { width: 140px; }
+.gex-controls b { color: #0d6efd; min-width: 34px; }
 .charm-badge { font-weight: 600; font-size: 12px; margin-left: 6px; padding: 2px 8px; border-radius: 10px; }
 .charm-badge.up { background: #e7f6ec; color: #1a7f37; }
 .charm-badge.down { background: #fdeaea; color: #b40426; }
+.em-badge { font-weight: 600; font-size: 12px; margin-left: 6px; padding: 2px 8px; border-radius: 10px; background: #eef2ff; color: #2451c7; }
 .charm-note { padding: 2px 12px 10px; font-size: 11px; color: #667; }
 .wheel-controls { padding: 6px 12px 2px; font-size: 12px; color: #667; }
 .wheel-controls select, .wheel-controls input { font-size: 12px; }

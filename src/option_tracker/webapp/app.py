@@ -26,6 +26,10 @@ from option_tracker.webapp.data import (
     get_cached_option_chain,
     get_cached_spot_price,
     get_cached_spy_price,
+    _compute_gex,
+    _compute_charm,
+    record_pin,
+    get_pin_history,
 )
 
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
@@ -125,6 +129,26 @@ async def ws_option_chain(ws: WebSocket):
 def api_option_chain():
     try:
         return get_cached_option_chain()
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(status_code=502, content={"error": str(exc)})
+
+
+@app.get("/api/gex")
+def api_gex(k: float = Query(0.0, ge=0.0, le=2.0)):
+    """Recompute GEX + charm off the cached chain using adjusted OI (OI + k·vol)."""
+    try:
+        payload = get_cached_option_chain()
+        spot = payload.get("lastSalePrice")
+        expiries = payload.get("expiries") or []
+        gex = _compute_gex(expiries, spot, blend_k=k)
+        record_pin(gex)
+        return {
+            "k": k,
+            "gex": gex,
+            "charm": _compute_charm(expiries, spot, blend_k=k),
+            "pin_history": get_pin_history(),
+        }
     except Exception as exc:
         traceback.print_exc()
         return JSONResponse(status_code=502, content={"error": str(exc)})

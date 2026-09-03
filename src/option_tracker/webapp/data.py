@@ -46,6 +46,41 @@ _ticker = None
 _cache_lock = threading.Lock()
 _cache = {"ts": 0.0, "payload": None}
 
+# In-memory pin-evolution history (survives page refreshes; ~1h gap = new session).
+_pin_lock = threading.Lock()
+_pin_hist = []
+
+
+def record_pin(gex):
+    """Append a pin snapshot (spot/flip/walls/total GEX) to the session buffer."""
+    if not gex:
+        return
+    # ET-wall-clock pinned to UTC, matching the spot chart's Nasdaq timestamp convention.
+    now = et_now().replace(tzinfo=timezone.utc).timestamp() * 1000.0
+    with _pin_lock:
+        if _pin_hist:
+            gap = now - _pin_hist[-1]["t"]
+            if gap < 3000:
+                return  # dedupe rapid re-polls
+            if gap > 3_600_000:
+                _pin_hist.clear()  # >1h idle => new trading session
+        _pin_hist.append({
+            "t": now,
+            "spot": _to_float(gex.get("spot")),
+            "flip": _to_float(gex.get("flip")),
+            "put_wall": _to_float(gex.get("put_wall")),
+            "call_wall": _to_float(gex.get("call_wall")),
+            "total_mm": _to_float(gex.get("total_mm")),
+        })
+        if len(_pin_hist) > 2500:
+            del _pin_hist[0]
+
+
+def get_pin_history():
+    with _pin_lock:
+        return list(_pin_hist)
+
+
 # Reuse Black-Scholes IV across cycles while spot barely moves (recompute anchor).
 IV_PRICE_THRESHOLD = 0.50
 _iv_state = {"price": None, "date": None, "strike_hash": None, "by_expiry": {}}
@@ -237,12 +272,15 @@ def _wheel_candidates(g, expirydt, spot, prev_spot, lower_2sigma, upper_2sigma):
     return rows
 
 
-def _compute_gex(expiries, spot):
+def _compute_gex(expiries, spot, blend_k=0.0):
     """Aggregate dealer gamma exposure (GEX) across expiries.
 
     Convention: dealers long calls / short puts, so call gamma adds and put
     gamma subtracts. Per-strike value is dollar gamma per 1% spot move
     (Γ·OI·100·S²·0.01). Returns the profile plus gamma-flip and wall levels.
+
+    blend_k > 0 nowcasts positioning by using adjusted OI = OI + k·today's-volume,
+    dragging the walls/flip toward where today's flow concentrated.
     """
     if not spot or spot <= 0:
         return None
@@ -255,6 +293,7 @@ def _compute_gex(expiries, spot):
         T = bd / 252.0
         strikes, c_oi, p_oi = e.get("strikes") or [], e.get("c_oi") or [], e.get("p_oi") or []
         c_iv, p_iv = e.get("c_iv") or [], e.get("p_iv") or []
+        c_vol, p_vol = e.get("c_vol") or [], e.get("p_vol") or []
         for i, K in enumerate(strikes):
             if K is None:
                 continue
@@ -262,6 +301,9 @@ def _compute_gex(expiries, spot):
             piv = p_iv[i] / 100.0 if i < len(p_iv) and p_iv[i] else None
             coi = c_oi[i] if i < len(c_oi) and c_oi[i] else 0
             poi = p_oi[i] if i < len(p_oi) and p_oi[i] else 0
+            if blend_k:
+                coi += blend_k * (c_vol[i] if i < len(c_vol) and c_vol[i] else 0)
+                poi += blend_k * (p_vol[i] if i < len(p_vol) and p_vol[i] else 0)
             if (civ is None and piv is None) or (coi == 0 and poi == 0):
                 continue
             legs.append((K, T, civ, coi, piv, poi))
@@ -327,13 +369,15 @@ def _compute_gex(expiries, spot):
     }
 
 
-def _compute_charm(expiries, spot):
+def _compute_charm(expiries, spot, blend_k=0.0):
     """Charm-driven dealer hedge flow between now and today's 4pm close.
 
     Charm = delta decay: with spot and IV held fixed, option deltas drift as time
     passes, forcing dealers to re-hedge. Convention matches GEX (dealers long
     calls / short puts). Positive flow = dealers must BUY into the close (upward
     pin drift); negative = must SELL (downward). Reported in $mm.
+
+    blend_k > 0 uses adjusted OI = OI + k·today's-volume (positioning nowcast).
     """
     if not spot or spot <= 0:
         return None
@@ -359,11 +403,15 @@ def _compute_charm(expiries, spot):
         strikes = e.get("strikes") or []
         c_oi, p_oi = e.get("c_oi") or [], e.get("p_oi") or []
         c_iv, p_iv = e.get("c_iv") or [], e.get("p_iv") or []
+        c_vol, p_vol = e.get("c_vol") or [], e.get("p_vol") or []
         for i, K in enumerate(strikes):
             if K is None:
                 continue
             coi = c_oi[i] if i < len(c_oi) and c_oi[i] else 0
             poi = p_oi[i] if i < len(p_oi) and p_oi[i] else 0
+            if blend_k:
+                coi += blend_k * (c_vol[i] if i < len(c_vol) and c_vol[i] else 0)
+                poi += blend_k * (p_vol[i] if i < len(p_vol) and p_vol[i] else 0)
             civ = c_iv[i] / 100.0 if i < len(c_iv) and c_iv[i] else None
             piv = p_iv[i] / 100.0 if i < len(p_iv) and p_iv[i] else None
             if coi == 0 and poi == 0:

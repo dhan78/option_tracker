@@ -5,7 +5,7 @@ Highcharts.setOptions({ chart: { animation: false }, plotOptions: { series: { an
 const REFRESH_MS = 30000; // polling fallback only; primary transport is WebSocket
 const state = {
   charts: new Map(), byExpiry: new Map(), leftMax: { oi: null, vol: null },
-  heatmap: null, smile: null, current: null, polling: false, ivCache: new Map(), highlight: null, spot: null, gex: null, gexCurve: null, charm: null,
+  heatmap: null, smile: null, current: null, polling: false, ivCache: new Map(), highlight: null, spot: null, gex: null, gexCurve: null, charm: null, blendK: 0.3, pinHistory: [], pinChart: null,
 };
 
 function maxOf(arrays) {
@@ -258,6 +258,7 @@ function buildAll(payload) {
   buildSmile(payload);
   buildGex(payload);
   buildCharm(payload);
+  if (state.blendK > 0) applyBlend();
   updateWheel(payload);
 
   payload.expiries.forEach((exp, i) => {
@@ -388,6 +389,15 @@ function gexBadge(gex) {
     : `🔴 Short gamma · trending · ${fmt(gex.total_mm, 0)} $mm/1%`;
 }
 
+function emBadge() {
+  const el = document.getElementById("em-badge");
+  if (!el) return;
+  const m = expectedMove();
+  if (!m) { el.textContent = ""; return; }
+  el.className = "em-badge";
+  el.textContent = `↔ Exp move ±$${fmt(m.em, 1)} (${fmt(m.lo, 0)}–${fmt(m.hi, 0)})`;
+}
+
 function gexPlotLines(gex) {
   const lines = [];
   if (window.__lastPrice != null) lines.push({ value: window.__lastPrice, color: "#000", dashStyle: "Dash", width: 1.5, zIndex: 5, label: { text: `Spot $${fmt(window.__lastPrice)}`, rotation: 0, style: { color: "#000", fontWeight: "bold", fontSize: "10px", textOutline: "2px #fff" } } });
@@ -401,16 +411,134 @@ function gexData(gex) {
   return gex.strikes.map((s, i) => ({ x: s, y: gex.net_mm[i], color: gex.net_mm[i] >= 0 ? "rgb(0,128,0)" : "rgb(210,0,0)" }));
 }
 
+// Shared near-money x-domain so all three GEX charts line up vertically.
+function gexDomain(gex) {
+  const S = window.__lastPrice != null ? window.__lastPrice : (gex && gex.spot);
+  if (S == null) return null;
+  let lo = S * 0.92, hi = S * 1.08;
+  if (gex && gex.put_wall != null) lo = Math.min(lo, gex.put_wall);
+  if (gex && gex.call_wall != null) hi = Math.max(hi, gex.call_wall);
+  const pad = (hi - lo) * 0.04;
+  return [lo - pad, hi + pad];
+}
+
+// Expected 1-day move from the nearest expiry's ATM straddle (~0.85 x straddle).
+function expectedMove() {
+  const p = state.current;
+  if (!p || !p.expiries || !p.expiries.length) return null;
+  const S = p.lastSalePrice;
+  const e = p.expiries[0];
+  let bi = -1, bd = Infinity;
+  (e.strikes || []).forEach((k, i) => { if (k == null) return; const d = Math.abs(k - S); if (d < bd) { bd = d; bi = i; } });
+  if (bi < 0) return null;
+  const c = e.c_last && e.c_last[bi], pu = e.p_last && e.p_last[bi];
+  if (c == null || pu == null) return null;
+  const em = (c + pu) * 0.85;
+  return { em, lo: S - em, hi: S + em, expiry: e.expiry };
+}
+
+// Shaded expected-move band for the strike-axis GEX charts.
+function emBands() {
+  const m = expectedMove();
+  if (!m) return [];
+  return [{ from: m.lo, to: m.hi, color: "rgba(41,98,255,0.07)", zIndex: 5,
+    label: { text: `Exp move ±$${fmt(m.em, 1)}`, align: "center", verticalAlign: "top", y: 8,
+      style: { fontSize: "10px", color: "#2451c7", fontWeight: "bold", textOutline: "2px #fff" } } }];
+}
+
+// ── Pin-evolution tracker: session history of spot / flip / walls / total GEX ─
+function recordPinPoint(gex) {
+  if (!gex) return;
+  const S = gex.spot != null ? gex.spot : window.__lastPrice;
+  const h = state.pinHistory;
+  const now = etAsUtcMs();
+  if (h.length && now - h[h.length - 1].t < 3000) return; // dedupe rapid re-renders
+  h.push({ t: now, spot: S, flip: gex.flip, put_wall: gex.put_wall, call_wall: gex.call_wall, total_mm: gex.total_mm });
+  if (h.length > 2500) h.shift();
+}
+
+// ET wall-clock encoded as a UTC epoch — matches the spot chart / server timestamps.
+function etAsUtcMs() {
+  const p = {};
+  new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+    .formatToParts(new Date()).forEach((x) => { p[x.type] = x.value; });
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second);
+}
+
+function pinData(key) {
+  return state.pinHistory.filter((p) => p[key] != null).map((p) => [p.t, p[key]]);
+}
+
+// One-line live verdict of the current pin state for the chart title.
+function pinSummary() {
+  const h = state.pinHistory;
+  if (!h.length) return "Pin evolution — accumulating…";
+  const p = h[h.length - 1];
+  const S = p.spot, tot = p.total_mm, flip = p.flip, pw = p.put_wall, cw = p.call_wall;
+  let tag;
+  if (tot == null) tag = "Pin evolution";
+  else if (tot > 150) tag = `🔒 PINNED · long +${fmt(tot, 0)}mm`;
+  else if (tot < -150) tag = `🔓 UNPINNED · short ${fmt(tot, 0)}mm`;
+  else tag = `⚖️ KNIFE-EDGE · ${fmt(tot, 0)}mm`;
+  const box = (pw != null && cw != null) ? ` · box ${fmt(pw, 0)}–${fmt(cw, 0)}` : "";
+  let where = "";
+  if (S != null) {
+    if (cw != null && Math.abs(S - cw) <= 0.75) where = ` · spot ${fmt(S, 1)} on call wall`;
+    else if (pw != null && Math.abs(S - pw) <= 0.75) where = ` · spot ${fmt(S, 1)} on put wall`;
+    else where = ` · spot ${fmt(S, 1)}`;
+  }
+  let cush = "";
+  if (flip != null && S != null) { const d = S - flip; cush = ` · flip ${fmt(flip, 0)} (${d >= 0 ? "+" : ""}${fmt(d, 1)})`; }
+  let trend = "";
+  if (h.length > 6) {
+    const prev = h[Math.max(0, h.length - 11)].total_mm;
+    if (prev != null && tot != null && Math.abs(tot - prev) > 50) trend = tot - prev > 0 ? " · tightening ↑" : " · loosening ↓";
+  }
+  return `${tag}${box}${where}${cush}${trend}`;
+}
+
+function buildPinHistory() {
+  state.pinChart = Highcharts.chart("pin-history", {
+    chart: { height: 240, spacingTop: 16, zoomType: "x" },
+    title: { text: pinSummary(), align: "left", style: { fontSize: "12px" } },
+    credits: { enabled: false },
+    legend: { enabled: true, itemStyle: { fontSize: "9px" } },
+    xAxis: { type: "datetime", crosshair: true },
+    yAxis: [
+      { title: { text: "Price" } },
+      { title: { text: "Total GEX ($mm)" }, opposite: true, gridLineWidth: 0, plotLines: [{ value: 0, color: "#ccc", width: 1 }] },
+    ],
+    tooltip: { shared: true, xDateFormat: "%H:%M:%S" },
+    plotOptions: { series: { marker: { enabled: false }, lineWidth: 1.5 } },
+    series: [
+      { name: "Spot", color: "#000", data: pinData("spot") },
+      { name: "Flip", color: "purple", dashStyle: "ShortDash", data: pinData("flip") },
+      { name: "Call wall", color: "rgb(0,128,0)", dashStyle: "ShortDash", data: pinData("call_wall") },
+      { name: "Put wall", color: "rgb(210,0,0)", dashStyle: "ShortDash", data: pinData("put_wall") },
+      { name: "Total GEX", yAxis: 1, type: "area", color: "rgba(41,98,255,0.55)", negativeColor: "rgba(210,0,0,0.55)", fillOpacity: 0.08, threshold: 0, data: pinData("total_mm") },
+    ],
+  });
+}
+
+function updatePinHistory() {
+  if (!document.getElementById("pin-history")) return;
+  if (!state.pinChart) { buildPinHistory(); return; }
+  ["spot", "flip", "call_wall", "put_wall", "total_mm"].forEach((k, i) => state.pinChart.series[i].setData(pinData(k), false));
+  state.pinChart.setTitle({ text: pinSummary() }, false, false);
+  state.pinChart.redraw();
+}
+
 function buildGex(payload) {
   const gex = payload.gex;
   gexBadge(gex);
+  emBadge();
   if (!gex) { if (state.gex) { state.gex.destroy(); state.gex = null; } return; }
   state.gex = Highcharts.chart("gex-chart", {
     chart: { type: "column", height: 300, spacingTop: 20, zoomType: "x" },
     title: { text: "Net Dealer Gamma by Strike ($mm per 1% move)", align: "left", style: { fontSize: "13px" } },
     credits: { enabled: false },
     legend: { enabled: false },
-    xAxis: { title: { text: "Strike" }, crosshair: true, plotLines: gexPlotLines(gex) },
+    xAxis: { title: { text: "Strike" }, crosshair: true, min: gexDomain(gex)?.[0], max: gexDomain(gex)?.[1], plotBands: emBands(), plotLines: gexPlotLines(gex) },
     yAxis: { title: { text: "GEX ($mm)" }, plotLines: [{ value: 0, color: "#888", width: 1, zIndex: 3 }] },
     tooltip: {
       formatter() {
@@ -427,10 +555,11 @@ function buildGex(payload) {
 function updateGex(payload) {
   const gex = payload.gex;
   gexBadge(gex);
+  emBadge();
   if (!gex) return;
   if (!state.gex) { buildGex(payload); return; }
   state.gex.series[0].setData(gexData(gex), false);
-  state.gex.xAxis[0].update({ plotLines: gexPlotLines(gex) }, false);
+  state.gex.xAxis[0].update({ min: gexDomain(gex)?.[0], max: gexDomain(gex)?.[1], plotBands: emBands(), plotLines: gexPlotLines(gex) }, false);
   state.gex.redraw();
   updateGexCurve(gex);
 }
@@ -455,7 +584,7 @@ function buildGexCurve(gex) {
     title: { text: "Total GEX as spot moves (dome = long gamma · dip = short gamma)", align: "left", style: { fontSize: "12px" } },
     credits: { enabled: false },
     legend: { enabled: false },
-    xAxis: { title: { text: "Hypothetical spot" }, crosshair: true, plotLines: gexCurvePlotLines(gex) },
+    xAxis: { title: { text: "Hypothetical spot" }, crosshair: true, min: gexDomain(gex)?.[0], max: gexDomain(gex)?.[1], plotBands: emBands(), plotLines: gexCurvePlotLines(gex) },
     yAxis: { title: { text: "GEX ($mm)" }, plotLines: [{ value: 0, color: "#888", width: 1, zIndex: 3 }] },
     tooltip: {
       formatter() {
@@ -471,7 +600,7 @@ function updateGexCurve(gex) {
   if (!gex || !gex.curve) return;
   if (!state.gexCurve) { buildGexCurve(gex); return; }
   state.gexCurve.series[0].setData(gex.curve, false);
-  state.gexCurve.xAxis[0].update({ plotLines: gexCurvePlotLines(gex) }, false);
+  state.gexCurve.xAxis[0].update({ min: gexDomain(gex)?.[0], max: gexDomain(gex)?.[1], plotBands: emBands(), plotLines: gexCurvePlotLines(gex) }, false);
   state.gexCurve.redraw();
 }
 
@@ -500,7 +629,7 @@ function buildCharm(payload) {
     title: { text: "Into-close hedge flow by strike ($mm) — green = dealers buy (pull ↑) · red = sell (pull ↓)", align: "left", style: { fontSize: "12px" } },
     credits: { enabled: false },
     legend: { enabled: false },
-    xAxis: { title: { text: "Strike" }, crosshair: true, plotLines: gexPlotLines(payload.gex || {}) },
+    xAxis: { title: { text: "Strike" }, crosshair: true, min: gexDomain(payload.gex)?.[0], max: gexDomain(payload.gex)?.[1], plotLines: gexPlotLines(payload.gex || {}) },
     yAxis: { title: { text: "Hedge flow ($mm)" }, plotLines: [{ value: 0, color: "#888", width: 1, zIndex: 3 }] },
     tooltip: {
       formatter() {
@@ -518,7 +647,7 @@ function updateCharm(payload) {
   if (!charm) { if (state.charm) { state.charm.destroy(); state.charm = null; } return; }
   if (!state.charm) { buildCharm(payload); return; }
   state.charm.series[0].setData(charmData(charm), false);
-  state.charm.xAxis[0].update({ plotLines: gexPlotLines(payload.gex || {}) }, false);
+  state.charm.xAxis[0].update({ min: gexDomain(payload.gex)?.[0], max: gexDomain(payload.gex)?.[1], plotLines: gexPlotLines(payload.gex || {}) }, false);
   state.charm.redraw();
 }
 
@@ -581,7 +710,7 @@ function renderWheel() {
 // Per-expiry yield ladder: annualized ROC by strike with that expiry's spot + gamma walls.
 function expiryLadderData(rows, side, key) {
   return rows.filter((r) => r.side === side)
-    .map((r) => ({ x: r.strike, y: r[key], dte: r.dte }))
+    .map((r) => ({ x: r.strike, y: r[key], dte: r.dte, pop: r.pop, delta: r.delta }))
     .filter((p) => p.y != null)
     .sort((a, b) => a.x - b.x);
 }
@@ -617,7 +746,7 @@ function ladderChart(el, exp, wheel) {
     tooltip: {
       useHTML: true, headerFormat: "",
       pointFormatter() {
-        return `<b>${this.series.name} $${fmt(this.x, 1)}</b> (${this.dte}d)<br/>ROC <b>${fmt(this.y, 0)}%</b>`;
+        return `<b>${this.series.name} $${fmt(this.x, 1)}</b> (${this.dte}d)<br/>ROC <b>${fmt(this.y, 0)}%</b><br/>PoP ${this.pop != null ? fmt(this.pop, 0) + "%" : "—"} · Δ ${this.delta != null ? fmt(this.delta, 2) : "—"}`;
       },
     },
     series: ladderSeries(rows),
@@ -653,11 +782,40 @@ function updateWheel(payload) {
   bind("w-maxdte", "maxDte", true);
 })();
 
+// Adjusted-OI blend: recompute GEX + charm off the cached chain at OI + k·volume.
+async function applyBlend() {
+  try {
+    const resp = await fetch(`/api/gex?k=${state.blendK}`);
+    const d = await resp.json();
+    if (!d || d.error) return;
+    updateGex({ gex: d.gex });
+    updateCharm({ gex: d.gex, charm: d.charm });
+    if (d.pin_history) { state.pinHistory = d.pin_history; updatePinHistory(); } // server-persisted
+  } catch (e) { /* keep last view on transient failure */ }
+}
+
+// Live blend => override the streamed k=0 GEX/charm; otherwise render as sent.
+function renderGex(payload) {
+  if (state.blendK > 0) applyBlend();
+  else { updateGex(payload); updateCharm(payload); recordPinPoint(payload.gex); updatePinHistory(); }
+}
+
+(function initGexBlend() {
+  const slider = document.getElementById("gex-blend");
+  const val = document.getElementById("gex-blend-val");
+  if (!slider) return;
+  slider.addEventListener("input", () => {
+    state.blendK = parseFloat(slider.value) || 0;
+    if (val) val.textContent = state.blendK.toFixed(2);
+    if (state.blendK > 0) applyBlend();
+    else if (state.current) { updateGex(state.current); updateCharm(state.current); }
+  });
+})();
+
 function updateAll(payload, changed) {
   window.__lastPrice = payload.lastSalePrice;
   payload.expiries.forEach((e) => state.byExpiry.set(e.expiry, e));
-  updateGex(payload);
-  updateCharm(payload);
+  renderGex(payload);
   updateWheel(payload);
   payload.expiries.forEach((exp) => updateExpiryLadder(exp, payload.wheel));
   if (changed && changed.size === 0) return; // idle delta: nothing else to redraw
@@ -682,11 +840,12 @@ function updateAll(payload, changed) {
 function renderStatus(payload) {
   const bar = document.getElementById("status-bar");
   const chg = payload.prevClose != null ? payload.lastSalePrice - payload.prevClose : null;
+  const pct = chg != null && payload.prevClose ? (chg / payload.prevClose) * 100 : null;
   const cls = chg == null ? "" : chg >= 0 ? "up" : "down";
   const sign = chg == null ? "" : chg >= 0 ? "+" : "";
   bar.innerHTML =
     `<span class="price">${payload.ticker} $${fmt(payload.lastSalePrice)}</span>` +
-    (chg != null ? `<span class="${cls}">${sign}${fmt(chg)}</span>` : "") +
+    (chg != null ? `<span class="${cls}">${sign}${fmt(chg)}${pct != null ? ` (${sign}${fmt(pct)}%)` : ""}</span>` : "") +
     `<span class="muted">Source: ${payload.dataSource || "—"}</span>` +
     `<span class="muted">Market: ${payload.marketStatus || "—"}</span>` +
     `<span class="muted">Updated: ${payload.timestamp}</span>`;
@@ -784,6 +943,14 @@ if (ivPanel) {
     if (!ivPanel.open) return;
     if (state.heatmap) state.heatmap.reflow();
     if (state.smile) state.smile.reflow();
+  });
+}
+
+// Smile starts collapsed; size it only once the user expands it.
+const smilePanel = document.getElementById("smile-panel");
+if (smilePanel) {
+  smilePanel.addEventListener("toggle", () => {
+    if (smilePanel.open && state.smile) state.smile.reflow();
   });
 }
 
@@ -961,17 +1128,176 @@ function openLadderHelp() {
 const ladderHelpLink = document.getElementById("ladder-help-link");
 if (ladderHelpLink) ladderHelpLink.addEventListener("click", (ev) => { ev.preventDefault(); openLadderHelp(); });
 
+function gexHelpHTML(payload) {
+  const f = (v, d = 2) => (v == null ? "—" : Number(v).toFixed(d));
+  const S = payload ? payload.lastSalePrice : null;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>How to read the GEX charts</title>
+    <style>
+      body{font-family:Arial,Helvetica,sans-serif;margin:20px;color:#222;background:#fafbfc;max-width:820px}
+      h1{font-size:18px} h2{font-size:14px;margin:0 0 6px;color:#2c3e50}
+      section{background:#fff;border:1px solid #e3e6ea;border-radius:8px;padding:12px 16px;margin-bottom:12px}
+      .formula{font-family:Consolas,monospace;font-size:13px;margin:4px 0;background:#f6f8fa;padding:4px 8px;border-radius:4px}
+      table.k{border-collapse:collapse;font-size:13px;margin:4px 0;width:100%} table.k td,table.k th{border:1px solid #e3e6ea;padding:4px 10px;text-align:left;vertical-align:top}
+      ul{margin:4px 0 4px 18px;padding:0} li{font-size:13px;margin:3px 0}
+      .hdr{color:#667;font-size:12px;margin-bottom:12px}
+      .green{color:rgb(0,128,0);font-weight:bold} .red{color:rgb(210,0,0);font-weight:bold} .purple{color:purple;font-weight:bold}
+      .warn{color:#a15c00}
+      .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:12px;font-weight:600}
+      .pill.long{background:#e7f6ec;color:#1a7f37} .pill.short{background:#fdeaea;color:#b40426}
+    </style></head><body>
+    <h1>Reading the Dealer-Gamma (GEX) panel</h1>
+    <div class="hdr">Five views, one story: where dealers are forced to hedge, and how that pushes price.${S != null ? ` Spot $${f(S)}.` : ""} Convention throughout: <b>dealers long calls / short puts</b>.</div>
+
+    <section>
+      <h2>First, the core idea</h2>
+      <ul>
+        <li><b>Gamma</b> = how fast a dealer's hedge (delta) changes as spot moves. Big gamma = big forced hedging.</li>
+        <li><span class="green">Positive / long gamma</span> → dealers hedge <b>against</b> the move: <b>sell rallies, buy dips</b>. Stabilizing, vol-suppressing, <b>pins</b> price.</li>
+        <li><span class="red">Negative / short gamma</span> → dealers hedge <b>with</b> the move: <b>sell dips, buy rallies</b>. Destabilizing, <b>amplifies</b> moves / trends.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Chart 1 — Net Dealer Gamma by Strike (bars)</h2>
+      <p>Net dollar gamma per 1% move, at each strike, at the current spot. <span class="formula">GEX = (Γ<sub>call</sub>·OI<sub>call</sub> − Γ<sub>put</sub>·OI<sub>put</sub>) · 100 · S² · 0.01</span></p>
+      <ul>
+        <li><span class="green">Green bar</span> = call-dominated strike (stabilizing / resistance).</li>
+        <li><span class="red">Red bar</span> = put-dominated strike (support, but destabilizing on a break).</li>
+        <li><b>Tallest green = call wall</b> (overhead magnet / resistance). <b>Deepest red = put wall</b> (downside magnet / support).</li>
+        <li>The tall bar tends to sit <b>at whatever strike spot is nearest</b> — it's gamma-driven, so it <i>hops</i> as price moves. That's your live pin magnet.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Chart 2 — Total GEX as spot moves (the dome/dip curve)</h2>
+      <p>Sums total dealer gamma at every <i>hypothetical</i> spot from ~0.8× to 1.18× — it shows the regime you'd be in if price were there.</p>
+      <ul>
+        <li><span class="green">Dome above zero</span> = long-gamma zone → dips bought, rallies sold, <b>vol suppressed, pins to walls</b>.</li>
+        <li><span class="red">Dip below zero</span> = short-gamma zone → moves amplified, <b>trending / air-pockets</b>.</li>
+        <li><span class="purple">Flip (γ-flip)</span> = the zero-crossing = the regime boundary. <b>Above flip = stabilizing; below flip = destabilizing.</b> The single most important level on the board.</li>
+        <li>Where the <b>spot line</b> sits on the curve tells you today's regime and how far the flip cushion is.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Chart 3 — Into-close hedge flow by strike (charm)</h2>
+      <p><b>Charm</b> = delta decay. As time runs to the 4pm close (spot &amp; IV held fixed), option deltas drift, forcing dealers to re-hedge.</p>
+      <ul>
+        <li><span class="green">Green bar</span> = dealers must <b>buy</b> at that strike → <b>upward pull</b>.</li>
+        <li><span class="red">Red bar</span> = dealers must <b>sell</b> → <b>downward pull</b>.</li>
+        <li>The <b>charm badge</b> sums it: a positive $mm total is the mechanical <b>into-close pin drift up</b>; negative = down.</li>
+        <li>Sign <b>flips as spot crosses a heavy strike</b> — either way it usually points <i>toward</i> the dominant pin. Strongest late-day, <b>fades to zero at the bell</b>.</li>
+        <li>It's small ($mm total) — a quiet-tape drift, <b>not</b> a match for the gamma cascade if a real move starts.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The badges &amp; levels</h2>
+      <table class="k">
+        <tr><th>Item</th><th>Means</th></tr>
+        <tr><td><span class="pill long">Long gamma</span></td><td>Stabilizing regime — fade moves, expect mean-reversion / pinning.</td></tr>
+        <tr><td><span class="pill short">Short gamma</span></td><td>Destabilizing regime — respect trends, expect amplified moves.</td></tr>
+        <tr><td><span class="purple">Flip</span></td><td>Regime boundary (zero-gamma). Reclaim/lose it = regime change.</td></tr>
+        <tr><td><span class="green">Call wall</span></td><td>Biggest positive-gamma strike — resistance / upside pin.</td></tr>
+        <tr><td><span class="red">Put wall</span></td><td>Biggest negative-gamma strike — support / downside pin; a break drops you toward the short-gamma trough.</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Adjusted OI (the k slider)</h2>
+      <ul>
+        <li>Raw GEX uses <b>T-1 open interest</b>, which goes stale after a gap. The slider blends in today's volume: <span class="formula">adjusted OI = OI + k × today's volume</span></li>
+        <li><b>k = 0</b> → pure settled OI. <b>k ≈ 0.3</b> → nowcast that drags the walls/flip toward where today's flow actually is.</li>
+        <li>Trust the <b>wall/flip locations</b>, not the absolute $mm at high k (volume can dwarf OI on a busy/0DTE day).</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The blue Expected-Move band (on charts 1 &amp; 2)</h2>
+      <p>The shaded blue region = <b>spot ± the market's expected 1-day move</b>, from the nearest expiry's ATM straddle.</p>
+      <p class="formula">Expected move ≈ 0.85 × (ATM call + ATM put)</p>
+      <ul>
+        <li>It's the market's own estimate of how far price is likely to travel by expiration (~1 standard deviation).</li>
+        <li><b>Walls <i>inside</i> the band</b> → the market prices a move that can reach them → that side is genuinely at risk (riskier to sell).</li>
+        <li><b>Walls <i>outside</i> the band</b> → the market doesn't expect price to get there → safer premium sale on that side.</li>
+        <li>For a condor: the band tells you which short strike is <b>live</b> (inside) vs <b>safe</b> (outside).</li>
+        <li>It <b>shrinks through the day</b> as theta bleeds — a 0DTE band collapses toward zero into the close.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Pin-evolution tracker (bottom chart)</h2>
+      <p>A live session history of <b>spot · flip · call wall · put wall</b> (price axis) plus <b>total GEX</b> (right axis, <span class="green">blue = long</span> / <span class="red">red = short</span>).</p>
+      <ul>
+        <li><b>Walls converging on spot + total GEX rising</b> → the pin is <b>tightening</b> (safer to sell the range, esp. into the close).</li>
+        <li><b>Spot approaching the flip / total GEX falling toward zero</b> → the pin is <b>fragile</b> — a regime flip is near.</li>
+        <li><b>Walls migrating</b> (e.g. call wall stepping up as price rises) → the box is <b>moving</b>, not fixed — don't trust a static range.</li>
+        <li>Accumulates while the page is open; <b>resets on refresh</b>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How to trade each regime</h2>
+      <ul>
+        <li><span class="green">Long gamma (above flip):</span> range/pin bias. Sell premium, fade extremes, target the walls. Breakouts tend to fail.</li>
+        <li><span class="red">Short gamma (below flip):</span> trend/momentum bias. Moves accelerate; dips get sold. Don't fade; respect the break.</li>
+        <li><b>Walls</b> = pin targets &amp; where to anchor CCs (call wall) / CSPs (put wall).</li>
+        <li><b>Flip</b> = your line in the sand. Losing it flips the whole character of the tape.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 class="warn">Caveats</h2>
+      <ul>
+        <li class="warn">Assumes the <b>dealers long calls / short puts</b> convention — a simplification of true dealer positioning.</li>
+        <li class="warn">Base OI is <b>T-1</b>; the k-slider is a heuristic nowcast, not measured order flow.</li>
+        <li class="warn">Near-expiry ATM gamma <b>explodes</b> (T→0), so the tall bar can swing wildly in the last minutes.</li>
+        <li class="warn">Charm is a small drift that <b>expires at 4pm</b> — never a backstop against a real directional break.</li>
+        <li class="warn">Expected move uses the <b>0.85× straddle</b> rule of thumb; it's an estimate, and it collapses near expiry.</li>
+        <li class="warn">The pin-evolution history is <b>client-side</b> — it starts empty and resets whenever you refresh the page.</li>
+      </ul>
+    </section>
+    </body></html>`;
+}
+
+function openGexHelp() {
+  const w = window.open("", "gexhelp", "width=860,height=940,scrollbars=yes");
+  if (!w) return;
+  w.document.open();
+  w.document.write(gexHelpHTML(state.current));
+  w.document.close();
+}
+
+const gexHelpLink = document.getElementById("gex-help-link");
+if (gexHelpLink) gexHelpLink.addEventListener("click", (ev) => { ev.preventDefault(); openGexHelp(); });
+
 // ── Intraday TSLA spot chart (separate Nasdaq feed, refreshed every 60s) ─
+// Title shows both TSLA and SPY last + % change vs their prior close.
+function spotTitleHTML(tslaLast, spyLast) {
+  const seg = (name, last, prev) => {
+    if (last == null) return `${name} —`;
+    const px = Number(last).toFixed(2);
+    if (!prev) return `${name} $${px}`;
+    const chg = last - prev, pct = (chg / prev) * 100;
+    const col = chg >= 0 ? "rgb(0,128,0)" : "rgb(210,0,0)";
+    const sign = chg >= 0 ? "+" : "";
+    return `${name} $${px} <span style="color:${col}">${sign}${pct.toFixed(2)}%</span>`;
+  };
+  return `${seg("TSLA", tslaLast, state.tslaPrev)} &nbsp;·&nbsp; ${seg("SPY", spyLast, state.spyPrev)}`;
+}
+
 function buildSpotChart(payload) {
   if (state.spot) { state.spot.destroy(); state.spot = null; }
   const prev = payload.prevClose;
   const spyPrev = payload.spy_prevClose;
   const spyLast = payload.spy_last;
+  state.tslaPrev = prev;
+  state.spyPrev = spyPrev;
   state.spot = Highcharts.chart("spot-chart", {
     chart: { type: "line", height: 220, spacingTop: 16, zoomType: "x" },
     title: {
-      text: `TSLA $${payload.last != null ? Number(payload.last).toFixed(2) : "—"}` +
-            `  ·  SPY $${spyLast != null ? Number(spyLast).toFixed(2) : "—"}`,
+      useHTML: true,
+      text: spotTitleHTML(payload.last, spyLast),
       align: "left", style: { fontSize: "13px" },
     },
     credits: { enabled: false },
@@ -1024,8 +1350,7 @@ function connectSpotWS() {
     let m;
     try { m = JSON.parse(ev.data); } catch (e) { return; }
     if (m.price == null || !state.spot) return;
-    const spyTxt = m.spy != null ? `  ·  SPY $${Number(m.spy).toFixed(2)}` : "";
-    state.spot.setTitle({ text: `TSLA $${Number(m.price).toFixed(2)}${spyTxt}` }, false, false);
+    state.spot.setTitle({ text: spotTitleHTML(m.price, m.spy) }, false, false);
     // Streamed points render as dots filling toward the 4pm close.
     state.spot.series[0].addPoint({ x: m.t, y: m.price, marker: { enabled: true, radius: 2 } }, true, false);
     if (m.spy != null && state.spot.series[1]) {
