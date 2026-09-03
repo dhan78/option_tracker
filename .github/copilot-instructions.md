@@ -32,11 +32,6 @@ Stock options analytics dashboard using Dash for real-time and historical option
 2. Auto-saves to SQLite only when `marketStatus == 'Market Open'` and >15min since last save
 3. `get_charts()` accepts `replay=True` kwarg to render historical data from database
 
-### Proxy Configuration
-- `configure_proxy()` runs at module import, auto-detects JPM corporate network
-- Sets `http_proxy`/`https_proxy` env vars if `approxy.jpmchase.net:8080` is reachable
-- Required for Nasdaq API access in corporate environments
-
 ### Page Registration
 Pages in `pages/` directory must:
 - Call `dash.register_page(__name__, path='/', title='...', name='...')`
@@ -133,7 +128,6 @@ df = db.query_sql_data("SELECT * FROM tsla_nasdaq WHERE load_dt = '2024-01-03'")
 - **IV Percentage Units**: Always use decimal (0.4575) in calculations, convert to percentage (45.75%) only for display
 - **Chart Overlaps**: Text annotations positioned at specific offsets (e.g., `lastSalePrice + 2.5` for x, `atm_iv_avg + 5` for y)
 - **Date Format**: Use `'%b-%d-%Y'` consistently, NOT `'%B-%d-%Y'` (breaks in 5+ places if inconsistent)
-- **JPM Automation**: `jpm_login.py` requires Selenium + Firefox; expects `JPM_USER`/`JPM_PASSWORD` env vars
 
 ## Statistical Analysis Features
 - **ATM IV**: Industry standard = simple average of call and put IV at ATM strike

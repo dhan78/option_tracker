@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import orjson
+import certifi
 import requests
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -222,7 +223,7 @@ def api_leap_drilldown(url: str = Query(...)):
     if not url.startswith("https://app.quotemedia.com/"):
         raise HTTPException(status_code=400, detail="Unsupported drill-down URL.")
     try:
-        resp = requests.get(url, headers=get_headers(), timeout=15)
+        resp = requests.get(url, headers=get_headers(), timeout=15, verify=certifi.where())
         resp.raise_for_status()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Drill-down fetch failed: {exc}")

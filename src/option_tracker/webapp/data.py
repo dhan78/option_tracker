@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
+import certifi
 
 from option_tracker.utils.pc_utils import (
     Ticker,
@@ -585,7 +586,7 @@ def build_option_chain_payload():
 def _fetch_symbol_chart(symbol, assetclass):
     """Intraday [epoch_ms, price] points from the Nasdaq chart endpoint."""
     url = f"https://api.nasdaq.com/api/quote/{symbol}/chart?assetclass={assetclass}"
-    resp = requests.get(url, headers=get_headers(), timeout=15)
+    resp = requests.get(url, headers=get_headers(), timeout=15, verify=certifi.where())
     resp.raise_for_status()
     chart = (resp.json().get("data") or {}).get("chart") or []
     return [[int(p["x"]), _to_float(p["y"])] for p in chart if p.get("y") is not None]
@@ -594,7 +595,7 @@ def _fetch_symbol_chart(symbol, assetclass):
 def _fetch_symbol_quote(symbol, assetclass):
     """Return (last_price, prev_close) from the Nasdaq info endpoint."""
     url = f"https://api.nasdaq.com/api/quote/{symbol}/info?assetclass={assetclass}"
-    resp = requests.get(url, headers=get_headers(), timeout=15)
+    resp = requests.get(url, headers=get_headers(), timeout=15, verify=certifi.where())
     resp.raise_for_status()
     d = (resp.json().get("data") or {}).get("primaryData") or {}
     last = prev = None
