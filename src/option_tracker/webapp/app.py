@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import orjson
-import certifi
 import requests
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -47,6 +46,28 @@ def _et_epoch_ms():
     return int(et.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 app = FastAPI(title="Options Pulse")
+
+# Record pin snapshots continuously (k=0.3) so the tracker keeps filling even with
+# no browser open. Shares the 14s chain cache, so it adds no extra Nasdaq load.
+_PIN_RECORD_INTERVAL = 30
+
+
+async def _pin_recorder():
+    while True:
+        try:
+            payload = await asyncio.to_thread(get_cached_option_chain)
+            gex = await asyncio.to_thread(
+                _compute_gex, payload.get("expiries") or [], payload.get("lastSalePrice"), 0.3
+            )
+            record_pin(gex)
+        except Exception:
+            traceback.print_exc()
+        await asyncio.sleep(_PIN_RECORD_INTERVAL)
+
+
+@app.on_event("startup")
+async def _start_background_tasks():
+    asyncio.create_task(_pin_recorder())
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -143,7 +164,6 @@ def api_gex(k: float = Query(0.0, ge=0.0, le=2.0)):
         spot = payload.get("lastSalePrice")
         expiries = payload.get("expiries") or []
         gex = _compute_gex(expiries, spot, blend_k=k)
-        record_pin(gex)
         return {
             "k": k,
             "gex": gex,
@@ -223,7 +243,7 @@ def api_leap_drilldown(url: str = Query(...)):
     if not url.startswith("https://app.quotemedia.com/"):
         raise HTTPException(status_code=400, detail="Unsupported drill-down URL.")
     try:
-        resp = requests.get(url, headers=get_headers(), timeout=15, verify=certifi.where())
+        resp = requests.get(url, headers=get_headers(), timeout=15)
         resp.raise_for_status()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Drill-down fetch failed: {exc}")

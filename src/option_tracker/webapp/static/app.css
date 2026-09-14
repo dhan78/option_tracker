@@ -37,10 +37,10 @@ body {
   background: #fff;
   border-bottom: 1px solid #e3e6ea;
 }
-.status-bar .price { font-size: 22px; font-weight: 700; }
+.status-bar .price { font-size: 13px; font-weight: 700; }
 .status-bar .muted { color: #667; font-size: 13px; }
-.status-bar .up { color: var(--call); }
-.status-bar .down { color: var(--put); }
+.status-bar .up { color: var(--call); font-size: 13px; }
+.status-bar .down { color: var(--put); font-size: 13px; }
 
 #refresh-label { padding: 2px 18px 8px; font-size: 11px; color: #667; }
 .calc-link-row { padding: 0 18px 8px; }

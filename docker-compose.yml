@@ -6,6 +6,10 @@ services:
       - "8050:8050"
     environment:
       - TZ=America/New_York
+      # Pass through corporate proxy if set on the host (needed for the Nasdaq API).
+      - http_proxy=${http_proxy:-}
+      - https_proxy=${https_proxy:-}
+      - no_proxy=${no_proxy:-}
       # Streaming cadence knobs (seconds).
       - OPTION_STREAM_INTERVAL=${OPTION_STREAM_INTERVAL:-15}
       - SPOT_STREAM_INTERVAL=${SPOT_STREAM_INTERVAL:-5}

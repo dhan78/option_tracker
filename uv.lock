@@ -278,7 +278,6 @@ name = "option-tracker"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "certifi" },
     { name = "fastapi" },
     { name = "numpy" },
     { name = "orjson" },
@@ -292,7 +291,6 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "certifi", specifier = ">=2024.2.2" },
     { name = "fastapi", specifier = ">=0.110.0" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "orjson", specifier = ">=3.9.0" },

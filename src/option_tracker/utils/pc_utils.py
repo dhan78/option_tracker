@@ -4,6 +4,7 @@ import sys
 import math
 import time
 import random
+import socket
 import hashlib
 import pathlib
 import sqlite3
@@ -15,7 +16,6 @@ import dateutil.parser as dparse
 
 # === Third-Party Imports ===
 import requests
-import certifi
 import numpy as np
 import pandas as pd
 import simplejson as json
@@ -82,9 +82,56 @@ from sqlite3 import Error
 # Utility Functions
 # ---------------------------
 
+def get_host_ip():
+    """Get the primary non-loopback IPv4 address of the host."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't actually connect to internet
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def configure_proxy():
+    """Enable or disable proxy based on corporate network detection and alpacaproxy.
+    
+    Only runs if host IP starts with 10.122 (JPM corporate network).
+    Alpacaproxy is auto-started at boot by corporate on localhost:9443.
+    """
+    host_ip = get_host_ip()
+    print(f"Detected Host IP: {host_ip}")
+
+    if not host_ip.startswith("10.122"):
+        print("Proxy skipped (not on 10.122.x.x network).")
+        return
+
+    proxy_port = 9443
+
+    # Check if alpacaproxy is running (auto-started at boot by corporate)
+    proxy_running = False
+    try:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=1):
+            proxy_running = True
+    except Exception:
+        pass
+
+    if proxy_running:
+        os.environ["http_proxy"] = f"http://127.0.0.1:{proxy_port}"
+        os.environ["https_proxy"] = f"http://127.0.0.1:{proxy_port}"
+        print(f"Proxy enabled: alpacaproxy @ 127.0.0.1:{proxy_port}")
+    else:
+        os.environ.pop("http_proxy", None)
+        os.environ.pop("https_proxy", None)
+        print("Proxy disabled (alpacaproxy not responding on localhost:9443).")
+
+
 # ---------------------------
 # Initialization
 # ---------------------------
+
+configure_proxy()
 
 # Enum example
 class OIC_State(Enum):
@@ -135,7 +182,7 @@ def _fetch_treasury_curve():
     url = (f'https://home.treasury.gov/resource-center/data-chart-center/interest-rates/'
            f'daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve'
            f'&field_tdr_date_value={year}&page&_format=csv')
-    resp = requests.get(url, headers=get_headers(), timeout=10, verify=certifi.where())
+    resp = requests.get(url, headers=get_headers(), timeout=10)
     resp.raise_for_status()
     df = pd.read_csv(StringIO(resp.text))
     df['Date'] = pd.to_datetime(df['Date'])
@@ -346,7 +393,7 @@ class Ticker():
     def get_lastSalePrice(self): #Realtime price
         url = f'https://api.nasdaq.com/api/quote/{self.ticker}/info?assetclass=stocks'
         # url = 'https://api.nasdaq.com/api/quote/TSLA/realtime-trades?&limit=10&fromTime=00:00'
-        response = requests.get(url, headers=get_headers(), verify=certifi.where())
+        response = requests.get(url, headers=get_headers())
         lastSalePrice = response.json()['data']['primaryData']['lastSalePrice']
         netChange = response.json()['data']['primaryData']['netChange']
         self.marketStatus = response.json()['data']['marketStatus']
@@ -365,12 +412,12 @@ class Ticker():
     def get_prevBusDay(self):
         try:
             url = f'https://api.nasdaq.com/api/quote/{self.ticker}/historical?assetclass=stocks&fromdate={prev_friday_yyyy_mm_dd}&limit=1&todate={run_dt_yyyy_mm_dd}'
-            response = requests.get(url, headers=get_headers(), verify=certifi.where())
+            response = requests.get(url, headers=get_headers())
             lastBusDay = response.json()['data']['tradesTable']['rows'][0]['date']
             self.lastBusDay_yyyy_mm_dd = pd.to_datetime(lastBusDay).strftime('%Y-%m-%d')
         except Exception as e:
             url = f'https://api.nasdaq.com/api/quote/{self.ticker}/info?assetclass=stocks'
-            response = requests.get(url, headers=get_headers(), verify=certifi.where())
+            response = requests.get(url, headers=get_headers())
             self.lastBusDay_yyyy_mm_dd = pd.to_datetime(response.json()['data']['secondaryData']['lastTradeTimestamp'].split('ON')[1]).strftime(
                 '%Y-%m-%d')
 
@@ -537,7 +584,7 @@ class Ticker():
         weekly_expiry_end = weekly_expiry_target.strftime('%Y-%m-%d')
 
         url = f'https://api.nasdaq.com/api/quote/{self.ticker}/option-chain?assetclass=stocks&limit=100&fromdate={load_dt}&todate={weekly_expiry_end}&excode=oprac&callput=callput&money=at&type=all'
-        response = requests.get(url, headers=get_headers(), verify=certifi.where())
+        response = requests.get(url, headers=get_headers())
         # Nasdaq returns data.table = null after hours / when throttled; guard the
         # whole path so a missing table degrades to "no data" instead of crashing.
         payload = response.json() if response.content else None
@@ -581,7 +628,7 @@ class Nasdaq_Leap():
 
     def get_nasdaq_leap_option_chain(self):
         url = 'https://api.nasdaq.com/api/quote/TSLA/option-chain?assetclass=stocks&limit=6000&fromdate=all&todate=all&excode=oprac&callput=call&money=out&type=all'
-        res = requests.get(url, headers=get_headers(), verify=certifi.where())
+        res = requests.get(url, headers=get_headers())
         df = pd.DataFrame(json.loads(res.text)['data']['table']['rows'])
 
         df['expirygroup']=df['expirygroup'].replace('',np.nan)

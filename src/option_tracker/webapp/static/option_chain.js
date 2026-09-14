@@ -1,6 +1,6 @@
 "use strict";
 
-Highcharts.setOptions({ chart: { animation: false }, plotOptions: { series: { animation: false } }, xAxis: { title: { text: null } }, yAxis: { title: { text: null } } });
+Highcharts.setOptions({ chart: { animation: false, resetZoomButton: { position: { align: "left", verticalAlign: "bottom", x: 10, y: -8 }, relativeTo: "plotBox" } }, plotOptions: { series: { animation: false } }, tooltip: { valueDecimals: 2 }, xAxis: { title: { text: null } }, yAxis: { title: { text: null } } });
 
 const REFRESH_MS = 30000; // polling fallback only; primary transport is WebSocket
 const state = {
@@ -508,14 +508,40 @@ function buildPinHistory() {
       { title: { text: "Price" } },
       { title: { text: "Total GEX ($mm)" }, opposite: true, gridLineWidth: 0, plotLines: [{ value: 0, color: "#ccc", width: 1 }] },
     ],
-    tooltip: { shared: true, xDateFormat: "%H:%M:%S" },
-    plotOptions: { series: { marker: { enabled: false }, lineWidth: 1.5 } },
+    tooltip: {
+      shared: true, useHTML: true,
+      formatter() {
+        // Swatch that mirrors each trace: filled block for the area, dashed/solid line for the rest.
+        const swatch = (p) => {
+          const c = p.color || p.series.color, o = p.series.userOptions || {};
+          if (o.type === "area") return `<span style="display:inline-block;width:12px;height:9px;background:${c};vertical-align:middle;margin-right:4px"></span>`;
+          const dashed = /dash|dot/i.test(o.dashStyle || "");
+          return `<span style="display:inline-block;width:16px;border-top:3px ${dashed ? "dashed" : "solid"} ${c};vertical-align:middle;margin-right:4px"></span>`;
+        };
+        const pts = (this.points || []).slice();
+        const gex = pts.find((p) => p.series.name === "Total GEX");
+        const price = pts.filter((p) => p.series.name !== "Total GEX").sort((a, b) => b.y - a.y);
+        let s = `<b>${Highcharts.dateFormat("%H:%M:%S", this.x)}</b><br/>`;
+        price.forEach((p) => {
+          s += `${swatch(p)} ${p.series.name}: <b>${Highcharts.numberFormat(p.y, 2)}</b><br/>`;
+        });
+        if (gex) {
+          s += `<span style="color:#bbb">\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500</span><br/>`;
+          const pos = gex.y >= 0;
+          const bg = pos ? "#e7f6ec" : "#fdeaea", fg = pos ? "#1a7f37" : "#b40426";
+          const tag = pos ? "long" : "short";
+          s += `${swatch(gex)} Total GEX: <b style="background:${bg};color:${fg};padding:1px 6px;border-radius:4px">${Highcharts.numberFormat(gex.y, 0)} $mm ${tag}</b>`;
+        }
+        return s;
+      },
+    },
+    plotOptions: { series: { lineWidth: 1.5, marker: { enabled: false } } },
     series: [
-      { name: "Spot", color: "#000", data: pinData("spot") },
-      { name: "Flip", color: "purple", dashStyle: "ShortDash", data: pinData("flip") },
-      { name: "Call wall", color: "rgb(0,128,0)", dashStyle: "ShortDash", data: pinData("call_wall") },
-      { name: "Put wall", color: "rgb(210,0,0)", dashStyle: "ShortDash", data: pinData("put_wall") },
-      { name: "Total GEX", yAxis: 1, type: "area", color: "rgba(41,98,255,0.55)", negativeColor: "rgba(210,0,0,0.55)", fillOpacity: 0.08, threshold: 0, data: pinData("total_mm") },
+      { name: "Spot", color: "#000", zIndex: 5, dashStyle: "Dash", data: pinData("spot") },
+      { name: "Flip", color: "purple", data: pinData("flip") },
+      { name: "Call wall", color: "rgb(0,128,0)", step: "center", data: pinData("call_wall") },
+      { name: "Put wall", color: "rgb(210,0,0)", step: "center", data: pinData("put_wall") },
+      { name: "Total GEX", yAxis: 1, type: "area", color: "rgba(41,98,255,0.55)", negativeColor: "rgba(230,145,0,0.6)", fillOpacity: 0.08, threshold: 0, marker: { enabled: false }, data: pinData("total_mm") },
     ],
   });
 }
@@ -958,35 +984,47 @@ if (smilePanel) {
 function calcWindowHTML(payload) {
   const S = payload.lastSalePrice;
   const f = (v, d = 2) => (v == null ? "—" : Number(v).toFixed(d));
+  const data = [];
   let rows = "";
   payload.expiries.forEach((e) => {
     const a = e.atm || {}, pr = e.prob || {};
     if (a.avg_iv == null) return;
-    const bd = e.bus_days, T = bd / 252, sqrtT = Math.sqrt(T), iv = a.avg_iv / 100;
+    const i = data.length;
+    const bd = e.bus_days;
     const straddle = (a.call_price || 0) + (a.put_price || 0);
     const sigT = straddle / (0.8 * S);
+    data.push({ bd: bd, rate: pr.rate || 0, avg_iv: a.avg_iv });
     rows += `
       <section>
         <h2>${e.expiry}</h2>
         <table class="io">
           <tr><td>Spot S</td><td>$${f(S)}</td><td>ATM strike K</td><td>$${f(a.strike, 1)}</td></tr>
           <tr><td>Call IV</td><td>${f(a.call_iv, 1)}%</td><td>Put IV</td><td>${f(a.put_iv, 1)}%</td></tr>
-          <tr><td>ATM IV</td><td><b>${f(a.avg_iv, 1)}%</b></td><td>Call / Put price</td><td>$${f(a.call_price)} / $${f(a.put_price)}</td></tr>
+          <tr><td>IV used</td><td><b id="iv${i}">${f(a.avg_iv, 1)}%</b></td><td>Call / Put price</td><td>$${f(a.call_price)} / $${f(a.put_price)}</td></tr>
           <tr><td>Business days</td><td>${f(bd, 2)}</td><td>Calendar days</td><td>${f(pr.cal_days, 2)}</td></tr>
         </table>
-        <p class="formula"><b>Tenor</b>: T = ${f(bd, 2)}/252 = ${f(T, 5)},  √T = ${f(sqrtT, 4)}</p>
-        <p class="formula"><b>2σ move</b> = S · (IV/100) · √T · 2 = ${f(S)} · ${f(iv, 4)} · ${f(sqrtT, 4)} · 2 = <b>±${f(e.move)}</b></p>
-        <p class="formula"><b>2σ range</b> = [ $${f(e.lower_2sigma)},  $${f(e.upper_2sigma)} ]</p>
-        <p class="check"><b>Straddle check</b>: C+P = $${f(straddle)}; σ√T ≈ straddle/(0.8·S) = ${f(sigT, 4)}; 2σ ≈ 2S·σ√T = ±$${f(2 * S * sigT)}</p>
+        <p class="formula"><b>2σ move</b> = S · IV · √(bd/252) · 2 = <b id="mv${i}">±${f(e.move)}</b></p>
+        <p class="formula"><b>2σ range</b> = <span id="rg${i}">[ $${f(e.lower_2sigma)},  $${f(e.upper_2sigma)} ]</span></p>
+        <p class="check"><b>Market straddle anchor</b>: C+P = $${f(straddle)} → 2σ ≈ <b>±$${f(2 * S * sigT)}</b> (convention-free true expected move; the scenario above uses your IV)</p>
         <table class="prob">
           <caption>Probability of Expiring (±3σ, lognormal)</caption>
-          <tr><td>Below $${f(pr.lower)}</td><td>${f(pr.p_below, 2)}%</td></tr>
-          <tr class="mid"><td>Between $${f(pr.lower)} – $${f(pr.upper)}</td><td>${f(pr.p_between, 2)}%</td></tr>
-          <tr><td>Above $${f(pr.upper)}</td><td>${f(pr.p_above, 2)}%</td></tr>
+          <tr><td>Below $<span id="pl${i}">${f(pr.lower)}</span></td><td>${f(pr.p_below, 2)}%</td></tr>
+          <tr class="mid"><td>Between $<span id="pla${i}">${f(pr.lower)}</span> – $<span id="pua${i}">${f(pr.upper)}</span></td><td>${f(pr.p_between, 2)}%</td></tr>
+          <tr><td>Above $<span id="pu${i}">${f(pr.upper)}</span></td><td>${f(pr.p_above, 2)}%</td></tr>
         </table>
-        <p class="check">r = ${pr.rate != null ? (pr.rate * 100).toFixed(2) + "%" : "—"} (Treasury, calendar tenor) · lognormal drift μ = ${f(pr.drift, 5)} (q=0)</p>
       </section>`;
   });
+  const boot = "var S=" + S + ",D=" + JSON.stringify(data) + ";" +
+    "function g(id){return document.getElementById(id);}" +
+    "function ff(v){return (v==null||isNaN(v))?'\\u2014':Number(v).toFixed(2);}" +
+    "function recompute(){var ov=parseFloat(g('ivov').value);var use=(isFinite(ov)&&ov>0);" +
+    "g('ovlabel').textContent=use?('scenario IV '+ov+'%'):'live market IV';" +
+    "D.forEach(function(e,i){var iv=(use?ov:e.avg_iv)/100;var T=e.bd/252,sq=Math.sqrt(T),sig=iv*sq;" +
+    "var move=S*iv*sq*2,lo=S-move,hi=S+move;var drift=(e.rate-0.5*iv*iv)*T;" +
+    "var l3=S*Math.exp(drift-3*sig),u3=S*Math.exp(drift+3*sig);" +
+    "g('iv'+i).textContent=ff(use?ov:e.avg_iv)+'%';g('mv'+i).textContent='\\u00b1'+ff(move);" +
+    "g('rg'+i).textContent='[ $'+ff(lo)+',  $'+ff(hi)+' ]';" +
+    "g('pl'+i).textContent=ff(l3);g('pla'+i).textContent=ff(l3);g('pu'+i).textContent=ff(u3);g('pua'+i).textContent=ff(u3);});}";
   return `<!doctype html><html><head><meta charset="utf-8"><title>2σ & Probability — ${payload.ticker}</title>
     <style>
       body{font-family:Arial,Helvetica,sans-serif;margin:20px;color:#222;background:#fafbfc}
@@ -999,10 +1037,15 @@ function calcWindowHTML(payload) {
       table.prob td{border:1px solid #e3e6ea;padding:4px 10px;font-size:13px} table.prob tr.mid{background:#eef7ee;font-weight:bold}
       table.prob td:last-child{text-align:right}
       .hdr{color:#667;font-size:12px;margin-bottom:14px}
+      .ivbox{background:#eef2ff;border:1px solid #ccd6ff;border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:13px}
+      .ivbox input{width:70px;font-size:13px}
     </style></head><body>
     <h1>${payload.ticker} — 2σ &amp; Probability of Expiring</h1>
-    <div class="hdr">Spot $${f(S)} · updated ${payload.timestamp} · tenor = business-days/252 · 2σ &amp; probability share one total vol (3σ = 1.5×2σ)</div>
+    <div class="hdr">Spot $${f(S)} · updated ${payload.timestamp} · tenor = business-days/252</div>
+    <div class="ivbox"><b>Scenario IV override:</b> <input id="ivov" type="number" step="1" min="1" placeholder="market" oninput="recompute()" /> %
+      &nbsp;→ using <b id="ovlabel">live market IV</b>. Blank = live ATM IV; type e.g. <b>41</b> to match a broker assumption. (The market-straddle anchor stays fixed as the true expected move.)</div>
     ${rows}
+    <script>${boot}<\/script>
     </body></html>`;
 }
 
