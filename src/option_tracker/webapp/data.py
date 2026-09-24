@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import re
+import sqlite3
 import threading
 import time
 import traceback
@@ -51,8 +52,8 @@ _pin_lock = threading.Lock()
 _pin_hist = []
 
 
-def record_pin(gex):
-    """Append a pin snapshot (spot/flip/walls/total GEX) to the session buffer."""
+def record_pin(gex, atm_iv=None):
+    """Append a pin snapshot (spot/flip/walls/total GEX/ATM IV) to the session buffer."""
     if not gex:
         return
     # ET-wall-clock pinned to UTC, matching the spot chart's Nasdaq timestamp convention.
@@ -71,6 +72,7 @@ def record_pin(gex):
             "put_wall": _to_float(gex.get("put_wall")),
             "call_wall": _to_float(gex.get("call_wall")),
             "total_mm": _to_float(gex.get("total_mm")),
+            "atm_iv": _to_float(atm_iv),
         })
         if len(_pin_hist) > 2500:
             del _pin_hist[0]
@@ -79,6 +81,109 @@ def record_pin(gex):
 def get_pin_history():
     with _pin_lock:
         return list(_pin_hist)
+
+
+# ── Daily ATM-IV persistence (SQLite) ────────────────────────────────────────
+# Tracks each session's IV high/low/close so we can rank today's vol against
+# history and know what IV was realistically sellable (the daily peak that later
+# got crushed) before writing a covered call.
+_iv_db_lock = threading.Lock()
+
+
+def _iv_db_conn():
+    conn = sqlite3.connect(db.DB_PATH, timeout=5)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS iv_daily (
+            date       TEXT PRIMARY KEY,
+            iv_open    REAL,
+            iv_high    REAL,
+            iv_low     REAL,
+            iv_close   REAL,
+            iv_high_tm TEXT,
+            updated_tm TEXT
+        )"""
+    )
+    return conn
+
+
+def record_iv_daily(atm_iv, market_status=None):
+    """Upsert today's ATM-IV OHLC row. Only captures IV during market hours."""
+    if atm_iv is None:
+        return
+    if market_status is not None and "open" not in str(market_status).lower():
+        return  # skip pre/post-market and weekends so peaks reflect live sessions
+    iv = _to_float(atm_iv)
+    if iv is None or iv <= 0:
+        return
+    now = et_now()
+    d, tm = now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
+    with _iv_db_lock:
+        conn = _iv_db_conn()
+        try:
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT iv_high, iv_low, iv_high_tm FROM iv_daily WHERE date=?", (d,)
+            ).fetchone()
+            if row is None:
+                cur.execute(
+                    "INSERT INTO iv_daily(date,iv_open,iv_high,iv_low,iv_close,iv_high_tm,updated_tm)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (d, iv, iv, iv, iv, tm, tm),
+                )
+            else:
+                hi, lo, hi_tm = row
+                new_hi, new_hi_tm = (iv, tm) if hi is None or iv > hi else (hi, hi_tm)
+                new_lo = iv if lo is None or iv < lo else lo
+                cur.execute(
+                    "UPDATE iv_daily SET iv_high=?, iv_low=?, iv_close=?, iv_high_tm=?, updated_tm=? WHERE date=?",
+                    (new_hi, new_lo, iv, new_hi_tm, tm, d),
+                )
+            conn.commit()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            conn.close()
+
+
+def _percentile(sorted_vals, p):
+    if not sorted_vals:
+        return None
+    i = min(len(sorted_vals) - 1, max(0, int(round(p * (len(sorted_vals) - 1)))))
+    return sorted_vals[i]
+
+
+def get_iv_stats(current_iv=None, lookback_days=252):
+    """IV-rank plus the distribution of daily IV *peaks* to guide premium selling."""
+    with _iv_db_lock:
+        conn = _iv_db_conn()
+        try:
+            rows = conn.execute(
+                "SELECT date, iv_high, iv_low, iv_close FROM iv_daily ORDER BY date DESC LIMIT ?",
+                (lookback_days,),
+            ).fetchall()
+        except Exception:
+            traceback.print_exc()
+            rows = []
+        finally:
+            conn.close()
+    if not rows:
+        return {"days": 0}
+    highs = sorted(r[1] for r in rows if r[1] is not None)
+    allvals = [v for r in rows for v in (r[1], r[2], r[3]) if v is not None]
+    lo52, hi52 = (min(allvals), max(allvals)) if allvals else (None, None)
+    stats = {
+        "days": len(rows),
+        "iv52_low": lo52,
+        "iv52_high": hi52,
+        "peak_median": _percentile(highs, 0.5),
+        "peak_p25": _percentile(highs, 0.25),
+        "peak_p75": _percentile(highs, 0.75),
+        "today_date": rows[0][0],
+        "today_high": rows[0][1],
+    }
+    if current_iv is not None and lo52 is not None and hi52 is not None and hi52 > lo52:
+        stats["iv_rank"] = round((_to_float(current_iv) - lo52) / (hi52 - lo52) * 100.0, 0)
+    return stats
 
 
 # Reuse Black-Scholes IV across cycles while spot barely moves (recompute anchor).

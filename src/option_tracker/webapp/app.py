@@ -30,6 +30,8 @@ from option_tracker.webapp.data import (
     _compute_charm,
     record_pin,
     get_pin_history,
+    record_iv_daily,
+    get_iv_stats,
 )
 
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
@@ -56,10 +58,13 @@ async def _pin_recorder():
     while True:
         try:
             payload = await asyncio.to_thread(get_cached_option_chain)
+            expiries = payload.get("expiries") or []
             gex = await asyncio.to_thread(
-                _compute_gex, payload.get("expiries") or [], payload.get("lastSalePrice"), 0.3
+                _compute_gex, expiries, payload.get("lastSalePrice"), 0.3
             )
-            record_pin(gex)
+            atm_iv = ((expiries[0] or {}).get("atm") or {}).get("avg_iv") if expiries else None
+            record_pin(gex, atm_iv)
+            record_iv_daily(atm_iv, payload.get("marketStatus"))
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(_PIN_RECORD_INTERVAL)
@@ -164,11 +169,13 @@ def api_gex(k: float = Query(0.0, ge=0.0, le=2.0)):
         spot = payload.get("lastSalePrice")
         expiries = payload.get("expiries") or []
         gex = _compute_gex(expiries, spot, blend_k=k)
+        atm_iv = ((expiries[0] or {}).get("atm") or {}).get("avg_iv") if expiries else None
         return {
             "k": k,
             "gex": gex,
             "charm": _compute_charm(expiries, spot, blend_k=k),
             "pin_history": get_pin_history(),
+            "iv_stats": get_iv_stats(atm_iv),
         }
     except Exception as exc:
         traceback.print_exc()

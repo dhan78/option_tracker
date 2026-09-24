@@ -41,7 +41,7 @@
           <div id="spot-chart" class="chart-box" style="min-height:220px;"></div>
         </details>
         <details id="gex-panel" class="collapsible" open>
-          <summary>Dealer Gamma (GEX) <span id="gex-badge" class="gex-badge"></span> <span id="charm-badge" class="charm-badge"></span> <span id="em-badge" class="em-badge"></span></summary>
+          <summary>Dealer Gamma (GEX) <span id="gex-badge" class="gex-badge"></span> <span id="charm-badge" class="charm-badge"></span> <span id="em-badge" class="em-badge"></span> <span id="iv-badge" class="iv-badge"></span></summary>
           <div class="gex-controls">Adjusted OI
             <input type="range" id="gex-blend" min="0" max="1" step="0.05" value="0.3" />
             k = <b id="gex-blend-val">0.30</b>
@@ -55,6 +55,8 @@
           <div class="charm-note"><b>Charm</b> = delta decay between now and today's 4pm close, with spot &amp; IV held fixed. As theta bleeds, option deltas drift and dealers must re-hedge: <b>green bars = they buy</b> (upward pull toward that strike), <b>red = they sell</b>. The badge sums it — a positive $mm total is the mechanical <b>into-close pin drift up</b>. Strongest near expiring OTM strikes; fades to zero at the bell.</div>
           <div id="pin-history" class="chart-box" style="min-height:240px;"></div>
           <div class="gex-note"><b>Pin evolution</b> — how spot, the γ-flip, and the put/call walls have moved through the session, with total GEX (blue = long / red = short) on the right axis. Watch the walls converge or migrate and total GEX build to judge whether the pin is tightening or breaking. The shaded band on the charts above is the <b>expected move</b> (nearest-expiry ATM straddle) — if the walls sit inside it, the market prices a move that can reach them. Accumulates live; resets on refresh.</div>
+          <div id="iv-history" class="chart-box" style="min-height:170px;"></div>
+          <div class="gex-note"><b>ATM IV (front expiry)</b> — the market's implied volatility through the session. A <b>spike</b> = fear/event premium being priced in; a <b>collapse</b> = that premium bleeding out (event passed or vol mean-reverting). Compare against the flat price tape: IV falling while spot barely moves is the classic long-gamma vol crush. Shaded band marks the session's IV range.</div>
         </details>
       </div>
       <div class="board-col">

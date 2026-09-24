@@ -5,7 +5,7 @@ Highcharts.setOptions({ chart: { animation: false, resetZoomButton: { position: 
 const REFRESH_MS = 30000; // polling fallback only; primary transport is WebSocket
 const state = {
   charts: new Map(), byExpiry: new Map(), leftMax: { oi: null, vol: null },
-  heatmap: null, smile: null, current: null, polling: false, ivCache: new Map(), highlight: null, spot: null, gex: null, gexCurve: null, charm: null, blendK: 0.3, pinHistory: [], pinChart: null,
+  heatmap: null, smile: null, current: null, polling: false, ivCache: new Map(), highlight: null, spot: null, gex: null, gexCurve: null, charm: null, blendK: 0.3, pinHistory: [], pinChart: null, ivChart: null, ivStats: null,
 };
 
 function maxOf(arrays) {
@@ -398,6 +398,45 @@ function emBadge() {
   el.textContent = `↔ Exp move ±$${fmt(m.em, 1)} (${fmt(m.lo, 0)}–${fmt(m.hi, 0)})`;
 }
 
+// Badge showing front ATM IV, its 52-week rank, and the typical sellable peak (CC target).
+function ivBadge() {
+  const el = document.getElementById("iv-badge");
+  if (!el) return;
+  const cur = atmIv();
+  if (cur == null) { el.textContent = ""; return; }
+  const st = state.ivStats;
+  let cls = "iv-badge", tag = "", colored = false;
+  // Prefer persisted 52-week context (IV-Rank) once we have enough daily history.
+  if (st && st.days >= 10 && st.iv_rank != null) {
+    tag = ` · Rank ${fmt(st.iv_rank, 0)}% (52w ${fmt(st.iv52_low, 0)}–${fmt(st.iv52_high, 0)})`;
+    if (st.peak_median != null) tag += ` · sell ≥ ${fmt(st.peak_median, 0)}`;
+    if (st.iv_rank >= 60) { cls += " spiking"; colored = true; }
+    else if (st.iv_rank >= 35) { cls += " elevated"; colored = true; }
+    else if (st.iv_rank <= 20) { cls += " crushed"; colored = true; }
+  } else {
+    // Fallback to intraday session range until the daily table fills in.
+    const ivs = state.pinHistory.map((p) => p.atm_iv).filter((v) => v != null);
+    if (ivs.length > 3) {
+      const lo = Math.min(...ivs), hi = Math.max(...ivs), span = hi - lo;
+      tag = ` · day ${fmt(lo, 0)}–${fmt(hi, 0)}`;
+      if (span >= 3) {
+        const pos = (cur - lo) / span;
+        if (pos >= 0.8) { cls += " spiking"; tag += " ▲ spiking"; colored = true; }
+        else if (pos >= 0.55) { cls += " elevated"; tag += " ▲"; colored = true; }
+        else if (pos <= 0.2) { cls += " crushed"; tag += " ▼ crushed"; colored = true; }
+      }
+    }
+  }
+  // Absolute-level fallback so the badge is never uninformatively grey.
+  if (!colored) {
+    if (cur >= 60) cls += " spiking";
+    else if (cur >= 45) cls += " elevated";
+    else if (cur <= 30) cls += " crushed";
+  }
+  el.className = cls;
+  el.textContent = `σ IV ${fmt(cur, 1)}%${tag}`;
+}
+
 function gexPlotLines(gex) {
   const lines = [];
   if (window.__lastPrice != null) lines.push({ value: window.__lastPrice, color: "#000", dashStyle: "Dash", width: 1.5, zIndex: 5, label: { text: `Spot $${fmt(window.__lastPrice)}`, rotation: 0, style: { color: "#000", fontWeight: "bold", fontSize: "10px", textOutline: "2px #fff" } } });
@@ -453,8 +492,15 @@ function recordPinPoint(gex) {
   const h = state.pinHistory;
   const now = etAsUtcMs();
   if (h.length && now - h[h.length - 1].t < 3000) return; // dedupe rapid re-renders
-  h.push({ t: now, spot: S, flip: gex.flip, put_wall: gex.put_wall, call_wall: gex.call_wall, total_mm: gex.total_mm });
+  h.push({ t: now, spot: S, flip: gex.flip, put_wall: gex.put_wall, call_wall: gex.call_wall, total_mm: gex.total_mm, atm_iv: atmIv() });
   if (h.length > 2500) h.shift();
+}
+
+// Front-expiry ATM implied vol (%) from the current payload.
+function atmIv() {
+  const p = state.current;
+  const v = p && p.expiries && p.expiries[0] && p.expiries[0].atm && p.expiries[0].atm.avg_iv;
+  return v != null ? +v : null;
 }
 
 // ET wall-clock encoded as a UTC epoch — matches the spot chart / server timestamps.
@@ -552,6 +598,35 @@ function updatePinHistory() {
   ["spot", "flip", "call_wall", "put_wall", "total_mm"].forEach((k, i) => state.pinChart.series[i].setData(pinData(k), false));
   state.pinChart.setTitle({ text: pinSummary() }, false, false);
   state.pinChart.redraw();
+}
+
+// Session ATM-IV range as a shaded plotBand so the spike/crush is obvious at a glance.
+function ivBands() {
+  const ivs = state.pinHistory.map((p) => p.atm_iv).filter((v) => v != null);
+  if (ivs.length < 3) return [];
+  return [{ from: Math.min(...ivs), to: Math.max(...ivs), color: "rgba(180,120,0,0.06)" }];
+}
+
+function buildIvHistory() {
+  state.ivChart = Highcharts.chart("iv-history", {
+    chart: { type: "spline", height: 170, spacingTop: 10 },
+    title: { text: "ATM IV (front expiry)", align: "left", style: { fontSize: "12px" } },
+    credits: { enabled: false },
+    legend: { enabled: false },
+    xAxis: { type: "datetime", crosshair: true },
+    yAxis: { title: { text: "IV %" }, plotBands: ivBands() },
+    tooltip: { xDateFormat: "%H:%M:%S", valueSuffix: "%", valueDecimals: 1 },
+    plotOptions: { series: { lineWidth: 2, marker: { enabled: false }, color: "#b26a00" } },
+    series: [{ name: "ATM IV", data: pinData("atm_iv") }],
+  });
+}
+
+function updateIvHistory() {
+  if (!document.getElementById("iv-history")) return;
+  if (!state.ivChart) { buildIvHistory(); return; }
+  state.ivChart.series[0].setData(pinData("atm_iv"), false);
+  state.ivChart.yAxis[0].update({ plotBands: ivBands() }, false);
+  state.ivChart.redraw();
 }
 
 function buildGex(payload) {
@@ -817,13 +892,16 @@ async function applyBlend() {
     updateGex({ gex: d.gex });
     updateCharm({ gex: d.gex, charm: d.charm });
     if (d.pin_history) { state.pinHistory = d.pin_history; updatePinHistory(); } // server-persisted
+    if (d.iv_stats) state.ivStats = d.iv_stats;
+    updateIvHistory();
+    ivBadge();
   } catch (e) { /* keep last view on transient failure */ }
 }
 
 // Live blend => override the streamed k=0 GEX/charm; otherwise render as sent.
 function renderGex(payload) {
   if (state.blendK > 0) applyBlend();
-  else { updateGex(payload); updateCharm(payload); recordPinPoint(payload.gex); updatePinHistory(); }
+  else { updateGex(payload); updateCharm(payload); recordPinPoint(payload.gex); updatePinHistory(); updateIvHistory(); ivBadge(); }
 }
 
 (function initGexBlend() {
