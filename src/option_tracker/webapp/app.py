@@ -32,6 +32,8 @@ from option_tracker.webapp.data import (
     get_pin_history,
     record_iv_daily,
     get_iv_stats,
+    get_tracked_tickers,
+    DEFAULT_TICKER,
 )
 
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
@@ -56,17 +58,18 @@ _PIN_RECORD_INTERVAL = 30
 
 async def _pin_recorder():
     while True:
-        try:
-            payload = await asyncio.to_thread(get_cached_option_chain)
-            expiries = payload.get("expiries") or []
-            gex = await asyncio.to_thread(
-                _compute_gex, expiries, payload.get("lastSalePrice"), 0.3
-            )
-            atm_iv = ((expiries[0] or {}).get("atm") or {}).get("avg_iv") if expiries else None
-            record_pin(gex, atm_iv)
-            record_iv_daily(atm_iv, payload.get("marketStatus"))
-        except Exception:
-            traceback.print_exc()
+        for ticker in get_tracked_tickers():
+            try:
+                payload = await asyncio.to_thread(get_cached_option_chain, ticker)
+                expiries = payload.get("expiries") or []
+                gex = await asyncio.to_thread(
+                    _compute_gex, expiries, payload.get("lastSalePrice"), 0.3
+                )
+                atm_iv = ((expiries[0] or {}).get("atm") or {}).get("avg_iv") if expiries else None
+                record_pin(gex, atm_iv, ticker)
+                record_iv_daily(atm_iv, payload.get("marketStatus"), ticker)
+            except Exception:
+                traceback.print_exc()
         await asyncio.sleep(_PIN_RECORD_INTERVAL)
 
 
@@ -132,11 +135,12 @@ def _diff_message(last, payload):
 async def ws_option_chain(ws: WebSocket):
     """Stream option-chain updates: an initial full payload then per-expiry deltas."""
     await ws.accept()
+    ticker = ws.query_params.get("ticker") or DEFAULT_TICKER
     last = None
     try:
         while True:
             try:
-                payload = await asyncio.to_thread(get_cached_option_chain)
+                payload = await asyncio.to_thread(get_cached_option_chain, ticker)
             except Exception as exc:
                 traceback.print_exc()
                 await ws.send_text(orjson.dumps({"error": str(exc)}).decode())
@@ -153,19 +157,19 @@ async def ws_option_chain(ws: WebSocket):
 
 
 @app.get("/api/option-chain")
-def api_option_chain():
+def api_option_chain(ticker: str = Query(DEFAULT_TICKER)):
     try:
-        return get_cached_option_chain()
+        return get_cached_option_chain(ticker)
     except Exception as exc:
         traceback.print_exc()
         return JSONResponse(status_code=502, content={"error": str(exc)})
 
 
 @app.get("/api/gex")
-def api_gex(k: float = Query(0.0, ge=0.0, le=2.0)):
+def api_gex(k: float = Query(0.0, ge=0.0, le=2.0), ticker: str = Query(DEFAULT_TICKER)):
     """Recompute GEX + charm off the cached chain using adjusted OI (OI + k·vol)."""
     try:
-        payload = get_cached_option_chain()
+        payload = get_cached_option_chain(ticker)
         spot = payload.get("lastSalePrice")
         expiries = payload.get("expiries") or []
         gex = _compute_gex(expiries, spot, blend_k=k)
@@ -174,8 +178,8 @@ def api_gex(k: float = Query(0.0, ge=0.0, le=2.0)):
             "k": k,
             "gex": gex,
             "charm": _compute_charm(expiries, spot, blend_k=k),
-            "pin_history": get_pin_history(),
-            "iv_stats": get_iv_stats(atm_iv),
+            "pin_history": get_pin_history(ticker),
+            "iv_stats": get_iv_stats(atm_iv, ticker),
         }
     except Exception as exc:
         traceback.print_exc()
@@ -192,9 +196,9 @@ def api_leap():
 
 
 @app.get("/api/spot")
-def api_spot():
+def api_spot(ticker: str = Query(DEFAULT_TICKER)):
     try:
-        return build_spot_payload()
+        return build_spot_payload(ticker)
     except Exception as exc:
         traceback.print_exc()
         return JSONResponse(status_code=502, content={"error": str(exc)})
@@ -202,8 +206,9 @@ def api_spot():
 
 @app.websocket("/ws/spot")
 async def ws_spot(ws: WebSocket):
-    """Stream TSLA's live last price; the client may set its own cadence."""
+    """Stream the ticker's live last price; the client may set its own cadence."""
     await ws.accept()
+    ticker = ws.query_params.get("ticker") or DEFAULT_TICKER
     cfg = {"interval": SPOT_INTERVAL_SECONDS}
 
     async def reader():
@@ -224,7 +229,7 @@ async def ws_spot(ws: WebSocket):
     try:
         while True:
             try:
-                price, status = await asyncio.to_thread(get_cached_spot_price)
+                price, status = await asyncio.to_thread(get_cached_spot_price, ticker)
                 spy = await asyncio.to_thread(get_cached_spy_price)
             except Exception:
                 await asyncio.sleep(cfg["interval"])

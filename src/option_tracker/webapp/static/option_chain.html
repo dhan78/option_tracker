@@ -14,6 +14,7 @@
 <body>
   <nav class="navbar">
     <span class="brand"><img class="brand-icon" src="/static/favicon.svg" alt="" />Options Pulse</span>
+    <span class="ticker-switch" id="ticker-switch"></span>
     <a href="/" class="active">PUT CALL Option Chain</a>
     <a href="/leap">LEAP Options</a>
   </nav>
@@ -28,7 +29,7 @@
     <div class="board">
       <div class="board-col">
         <details id="spot-panel" class="collapsible" open>
-          <summary>TSLA Spot (intraday)</summary>
+          <summary id="spot-panel-title">TSLA Spot (intraday)</summary>
           <div class="spot-controls">Live refresh:
             <select id="spot-interval">
               <option value="3">3s</option>

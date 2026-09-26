@@ -8,6 +8,21 @@ const state = {
   heatmap: null, smile: null, current: null, polling: false, ivCache: new Map(), highlight: null, spot: null, gex: null, gexCurve: null, charm: null, blendK: 0.3, pinHistory: [], pinChart: null, ivChart: null, ivStats: null,
 };
 
+// Ticker is URL-driven so separate browser tabs (?ticker=TSLA, ?ticker=SPCX) stay independent.
+const TICKER = (new URLSearchParams(location.search).get("ticker") || "TSLA").toUpperCase();
+const TICKERS = ["TSLA", "SPCX"]; // navbar quick-switch list
+const qTicker = (url) => url + (url.includes("?") ? "&" : "?") + "ticker=" + encodeURIComponent(TICKER);
+try { document.title = TICKER + " \u00b7 Options Pulse"; } catch (e) { /* non-browser */ }
+try {
+  document.addEventListener("DOMContentLoaded", () => {
+    const t = document.getElementById("spot-panel-title");
+    if (t) t.textContent = `${TICKER} Spot (intraday)`;
+    const sw = document.getElementById("ticker-switch");
+    if (sw) sw.innerHTML = TICKERS.map((s) =>
+      `<a href="/?ticker=${s}" class="ticker-btn${s === TICKER ? " active" : ""}">${s}</a>`).join("");
+  });
+} catch (e) { /* non-browser */ }
+
 function maxOf(arrays) {
   let m = 0;
   arrays.forEach((a) => a.forEach((v) => { if (v != null && v > m) m = v; }));
@@ -886,7 +901,7 @@ function updateWheel(payload) {
 // Adjusted-OI blend: recompute GEX + charm off the cached chain at OI + k·volume.
 async function applyBlend() {
   try {
-    const resp = await fetch(`/api/gex?k=${state.blendK}`);
+    const resp = await fetch(qTicker(`/api/gex?k=${state.blendK}`));
     const d = await resp.json();
     if (!d || d.error) return;
     updateGex({ gex: d.gex });
@@ -998,7 +1013,7 @@ function applyDelta(msg) {
 let pollTimer = null;
 async function pollOnce() {
   try {
-    const resp = await fetch("/api/option-chain");
+    const resp = await fetch(qTicker("/api/option-chain"));
     const payload = await resp.json();
     if (!resp.ok || payload.error) throw new Error(payload.error || `HTTP ${resp.status}`);
     render(payload);
@@ -1020,7 +1035,7 @@ function connectWS() {
   if (!window.WebSocket) { startPolling(); return; }
   const proto = location.protocol === "https:" ? "wss" : "ws";
   let ws;
-  try { ws = new WebSocket(`${proto}://${location.host}/ws/option-chain`); }
+  try { ws = new WebSocket(qTicker(`${proto}://${location.host}/ws/option-chain`)); }
   catch (e) { startPolling(); return; }
 
   const guard = setTimeout(startPolling, 6000); // fall back if no data arrives
@@ -1404,7 +1419,7 @@ function spotTitleHTML(tslaLast, spyLast) {
     const sign = chg >= 0 ? "+" : "";
     return `${name} $${px} <span style="color:${col}">${sign}${pct.toFixed(2)}%</span>`;
   };
-  return `${seg("TSLA", tslaLast, state.tslaPrev)} &nbsp;·&nbsp; ${seg("SPY", spyLast, state.spyPrev)}`;
+  return `${seg(TICKER, tslaLast, state.tslaPrev)} &nbsp;·&nbsp; ${seg("SPY", spyLast, state.spyPrev)}`;
 }
 
 function buildSpotChart(payload) {
@@ -1426,10 +1441,10 @@ function buildSpotChart(payload) {
     xAxis: { type: "datetime", crosshair: true, min: payload.sessionStart || null, max: payload.sessionEnd || null },
     yAxis: [
       {
-        title: { text: "TSLA", style: { color: "rgb(0,128,0)", fontSize: "10px" } },
+        title: { text: TICKER, style: { color: "rgb(0,128,0)", fontSize: "10px" } },
         labels: { style: { color: "rgb(0,128,0)" } },
         plotLines: prev != null ? [{ value: prev, color: "#888", dashStyle: "Dash", width: 1, zIndex: 3,
-          label: { text: `TSLA prev $${Number(prev).toFixed(2)}`, style: { fontSize: "9px", color: "#667" } } }] : [],
+          label: { text: `${TICKER} prev $${Number(prev).toFixed(2)}`, style: { fontSize: "9px", color: "#667" } } }] : [],
       },
       {
         title: { text: "SPY", style: { color: "#2962ff", fontSize: "10px" } },
@@ -1441,7 +1456,7 @@ function buildSpotChart(payload) {
     tooltip: { shared: true, xDateFormat: "%b %e, %H:%M", pointFormat: "<span style=\"color:{series.color}\">●</span> {series.name}: <b>${point.y:.2f}</b><br/>" },
     plotOptions: { series: { marker: { enabled: false }, lineWidth: 1.5 } },
     series: [
-      { name: "TSLA", yAxis: 0, color: "rgb(0,128,0)", negativeColor: "rgb(210,0,0)", threshold: prev != null ? prev : null, data: payload.points },
+      { name: TICKER, yAxis: 0, color: "rgb(0,128,0)", negativeColor: "rgb(210,0,0)", threshold: prev != null ? prev : null, data: payload.points },
       { name: "SPY", yAxis: 1, color: "#2962ff", data: payload.spy_points || [] },
     ],
   });
@@ -1449,7 +1464,7 @@ function buildSpotChart(payload) {
 
 async function loadSpot() {
   try {
-    const r = await fetch("/api/spot");
+    const r = await fetch(qTicker("/api/spot"));
     const p = await r.json();
     if (!r.ok || p.error) return;
     buildSpotChart(p);
@@ -1461,7 +1476,7 @@ function connectSpotWS() {
   if (!window.WebSocket) return;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   let ws;
-  try { ws = new WebSocket(`${proto}://${location.host}/ws/spot`); } catch (e) { return; }
+  try { ws = new WebSocket(qTicker(`${proto}://${location.host}/ws/spot`)); } catch (e) { return; }
   state.spotWS = ws;
   ws.onopen = () => {
     const sel = document.getElementById("spot-interval");

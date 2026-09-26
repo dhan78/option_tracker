@@ -40,32 +40,55 @@ from option_tracker.utils.pc_utils import (
 )
 
 
-# Created lazily on first request so importing the app never triggers network I/O.
-_ticker = None
+# Default ticker + validator. The symbol is threaded through every request so that
+# separate browser tabs (e.g. TSLA and SPCX) stay fully independent server-side.
+DEFAULT_TICKER = "TSLA"
 
-# Shared payload cache so many WebSocket clients don't each hammer the Nasdaq API.
+
+def _norm_ticker(t):
+    """Uppercase + validate a ticker symbol; fall back to the default if invalid."""
+    if not t:
+        return DEFAULT_TICKER
+    t = str(t).strip().upper()
+    return t if re.fullmatch(r"[A-Z]{1,6}", t) else DEFAULT_TICKER
+
+
+# Per-ticker Ticker instances, payload caches and spot caches (lazy, keyed by symbol).
+_ticker_lock = threading.Lock()
+_tickers = {}
+
 _cache_lock = threading.Lock()
-_cache = {"ts": 0.0, "payload": None}
+_caches = {}  # ticker -> {"ts", "payload"}
 
-# In-memory pin-evolution history (survives page refreshes; ~1h gap = new session).
+# Tickers requested this run, so the background recorder knows what to keep filling.
+_seen_tickers = {DEFAULT_TICKER}
+
+
+def get_tracked_tickers():
+    return list(_seen_tickers)
+
+
+# Per-ticker in-memory pin history (survives page refreshes; ~1h gap = new session).
 _pin_lock = threading.Lock()
-_pin_hist = []
+_pin_hist = {}  # ticker -> list of snapshots
 
 
-def record_pin(gex, atm_iv=None):
-    """Append a pin snapshot (spot/flip/walls/total GEX/ATM IV) to the session buffer."""
+def record_pin(gex, atm_iv=None, ticker=DEFAULT_TICKER):
+    """Append a pin snapshot (spot/flip/walls/total GEX/ATM IV) to the ticker's buffer."""
     if not gex:
         return
+    ticker = _norm_ticker(ticker)
     # ET-wall-clock pinned to UTC, matching the spot chart's Nasdaq timestamp convention.
     now = et_now().replace(tzinfo=timezone.utc).timestamp() * 1000.0
     with _pin_lock:
-        if _pin_hist:
-            gap = now - _pin_hist[-1]["t"]
+        hist = _pin_hist.setdefault(ticker, [])
+        if hist:
+            gap = now - hist[-1]["t"]
             if gap < 3000:
                 return  # dedupe rapid re-polls
             if gap > 3_600_000:
-                _pin_hist.clear()  # >1h idle => new trading session
-        _pin_hist.append({
+                hist.clear()  # >1h idle => new trading session
+        hist.append({
             "t": now,
             "spot": _to_float(gex.get("spot")),
             "flip": _to_float(gex.get("flip")),
@@ -74,13 +97,13 @@ def record_pin(gex, atm_iv=None):
             "total_mm": _to_float(gex.get("total_mm")),
             "atm_iv": _to_float(atm_iv),
         })
-        if len(_pin_hist) > 2500:
-            del _pin_hist[0]
+        if len(hist) > 2500:
+            del hist[0]
 
 
-def get_pin_history():
+def get_pin_history(ticker=DEFAULT_TICKER):
     with _pin_lock:
-        return list(_pin_hist)
+        return list(_pin_hist.get(_norm_ticker(ticker), []))
 
 
 # ── Daily ATM-IV persistence (SQLite) ────────────────────────────────────────
@@ -92,22 +115,40 @@ _iv_db_lock = threading.Lock()
 
 def _iv_db_conn():
     conn = sqlite3.connect(db.DB_PATH, timeout=5)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS iv_daily (
-            date       TEXT PRIMARY KEY,
-            iv_open    REAL,
-            iv_high    REAL,
-            iv_low     REAL,
-            iv_close   REAL,
-            iv_high_tm TEXT,
-            updated_tm TEXT
-        )"""
-    )
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(iv_daily)").fetchall()]
+    # Migrate the original single-ticker table (PK=date, no ticker column) in place.
+    if cols and "ticker" not in cols:
+        conn.execute("ALTER TABLE iv_daily RENAME TO iv_daily_legacy")
+        cols = []
+    if not cols:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS iv_daily (
+                ticker     TEXT,
+                date       TEXT,
+                iv_open    REAL,
+                iv_high    REAL,
+                iv_low     REAL,
+                iv_close   REAL,
+                iv_high_tm TEXT,
+                updated_tm TEXT,
+                PRIMARY KEY (ticker, date)
+            )"""
+        )
+        try:
+            if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='iv_daily_legacy'").fetchone():
+                conn.execute(
+                    "INSERT OR IGNORE INTO iv_daily(ticker,date,iv_open,iv_high,iv_low,iv_close,iv_high_tm,updated_tm)"
+                    " SELECT 'TSLA',date,iv_open,iv_high,iv_low,iv_close,iv_high_tm,updated_tm FROM iv_daily_legacy"
+                )
+                conn.execute("DROP TABLE iv_daily_legacy")
+                conn.commit()
+        except Exception:
+            traceback.print_exc()
     return conn
 
 
-def record_iv_daily(atm_iv, market_status=None):
-    """Upsert today's ATM-IV OHLC row. Only captures IV during market hours."""
+def record_iv_daily(atm_iv, market_status=None, ticker=DEFAULT_TICKER):
+    """Upsert today's ATM-IV OHLC row for a ticker. Only captures IV during market hours."""
     if atm_iv is None:
         return
     if market_status is not None and "open" not in str(market_status).lower():
@@ -115,6 +156,7 @@ def record_iv_daily(atm_iv, market_status=None):
     iv = _to_float(atm_iv)
     if iv is None or iv <= 0:
         return
+    ticker = _norm_ticker(ticker)
     now = et_now()
     d, tm = now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
     with _iv_db_lock:
@@ -122,21 +164,21 @@ def record_iv_daily(atm_iv, market_status=None):
         try:
             cur = conn.cursor()
             row = cur.execute(
-                "SELECT iv_high, iv_low, iv_high_tm FROM iv_daily WHERE date=?", (d,)
+                "SELECT iv_high, iv_low, iv_high_tm FROM iv_daily WHERE ticker=? AND date=?", (ticker, d)
             ).fetchone()
             if row is None:
                 cur.execute(
-                    "INSERT INTO iv_daily(date,iv_open,iv_high,iv_low,iv_close,iv_high_tm,updated_tm)"
-                    " VALUES(?,?,?,?,?,?,?)",
-                    (d, iv, iv, iv, iv, tm, tm),
+                    "INSERT INTO iv_daily(ticker,date,iv_open,iv_high,iv_low,iv_close,iv_high_tm,updated_tm)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (ticker, d, iv, iv, iv, iv, tm, tm),
                 )
             else:
                 hi, lo, hi_tm = row
                 new_hi, new_hi_tm = (iv, tm) if hi is None or iv > hi else (hi, hi_tm)
                 new_lo = iv if lo is None or iv < lo else lo
                 cur.execute(
-                    "UPDATE iv_daily SET iv_high=?, iv_low=?, iv_close=?, iv_high_tm=?, updated_tm=? WHERE date=?",
-                    (new_hi, new_lo, iv, new_hi_tm, tm, d),
+                    "UPDATE iv_daily SET iv_high=?, iv_low=?, iv_close=?, iv_high_tm=?, updated_tm=? WHERE ticker=? AND date=?",
+                    (new_hi, new_lo, iv, new_hi_tm, tm, ticker, d),
                 )
             conn.commit()
         except Exception:
@@ -152,14 +194,15 @@ def _percentile(sorted_vals, p):
     return sorted_vals[i]
 
 
-def get_iv_stats(current_iv=None, lookback_days=252):
+def get_iv_stats(current_iv=None, ticker=DEFAULT_TICKER, lookback_days=252):
     """IV-rank plus the distribution of daily IV *peaks* to guide premium selling."""
+    ticker = _norm_ticker(ticker)
     with _iv_db_lock:
         conn = _iv_db_conn()
         try:
             rows = conn.execute(
-                "SELECT date, iv_high, iv_low, iv_close FROM iv_daily ORDER BY date DESC LIMIT ?",
-                (lookback_days,),
+                "SELECT date, iv_high, iv_low, iv_close FROM iv_daily WHERE ticker=? ORDER BY date DESC LIMIT ?",
+                (ticker, lookback_days),
             ).fetchall()
         except Exception:
             traceback.print_exc()
@@ -188,37 +231,42 @@ def get_iv_stats(current_iv=None, lookback_days=252):
 
 # Reuse Black-Scholes IV across cycles while spot barely moves (recompute anchor).
 IV_PRICE_THRESHOLD = 0.50
-_iv_state = {"price": None, "date": None, "strike_hash": None, "by_expiry": {}}
+_iv_states = {}  # ticker -> {"price", "date", "strike_hash", "by_expiry"}
 
 
-def get_cached_option_chain(max_age_seconds=14):
-    """Return a recent option-chain payload, rebuilding at most once per window.
+def get_cached_option_chain(ticker=DEFAULT_TICKER, max_age_seconds=14):
+    """Return a recent option-chain payload for a ticker, rebuilt at most once per window.
 
     The build is serialised under the lock so concurrent callers share one fetch.
     """
+    ticker = _norm_ticker(ticker)
+    _seen_tickers.add(ticker)
     now = time.time()
     with _cache_lock:
-        if _cache["payload"] is not None and now - _cache["ts"] < max_age_seconds:
-            return _cache["payload"]
+        entry = _caches.get(ticker)
+        if entry is not None and entry["payload"] is not None and now - entry["ts"] < max_age_seconds:
+            return entry["payload"]
         try:
-            payload = build_option_chain_payload()
+            payload = build_option_chain_payload(ticker)
         except Exception:
             # After-hours / throttled Nasdaq: keep serving the last good snapshot
             # instead of blanking the dashboard. Only surface the error cold.
-            if _cache["payload"] is not None:
+            if entry is not None and entry["payload"] is not None:
                 traceback.print_exc()
-                return _cache["payload"]
+                return entry["payload"]
             raise
-        _cache["payload"] = payload
-        _cache["ts"] = time.time()
+        _caches[ticker] = {"payload": payload, "ts": time.time()}
         return payload
 
 
-def _get_ticker():
-    global _ticker
-    if _ticker is None:
-        _ticker = Ticker("TSLA")
-    return _ticker
+def _get_ticker(symbol=DEFAULT_TICKER):
+    symbol = _norm_ticker(symbol)
+    with _ticker_lock:
+        tk = _tickers.get(symbol)
+        if tk is None:
+            tk = Ticker(symbol)
+            _tickers[symbol] = tk
+        return tk
 
 
 def _to_float(value):
@@ -244,11 +292,16 @@ def _expiry_label(key):
     return pd.to_datetime(key).strftime("%b-%d-%Y")
 
 
-def _merge_daily_volume(df):
+def _merge_daily_volume(df, ticker=DEFAULT_TICKER):
     """Attach start-of-day volume so daily volume = current - open snapshot.
 
-    Falls back to total volume when no snapshot exists for today.
+    Only TSLA has an intraday snapshot table (``tsla_nasdaq``); other tickers fall
+    back to total volume.
     """
+    if _norm_ticker(ticker) != "TSLA":
+        df["c_Volume_1"] = df["c_Volume"]
+        df["p_Volume_1"] = df["p_Volume"]
+        return df
     try:
         df_vol = db.query_sql_data(
             "with st_tm as (select min(load_tm) as tm from tsla_nasdaq "
@@ -547,9 +600,12 @@ def _compute_charm(expiries, spot, blend_k=0.0):
     }
 
 
-def build_option_chain_payload():
+def build_option_chain_payload(ticker=DEFAULT_TICKER):
     """Return the option-chain dashboard data for every tracked expiry."""
-    _ticker = _get_ticker()
+    _ticker = _get_ticker(ticker)
+    _iv_state = _iv_states.setdefault(
+        _ticker.ticker, {"price": None, "date": None, "strike_hash": None, "by_expiry": {}}
+    )
     _ticker.get_lastSalePrice()
     last_price = _ticker.lastSalePrice
     df = _ticker.oic_api_call()
@@ -558,7 +614,7 @@ def build_option_chain_payload():
 
     numeric_cols = df.filter(regex="c_|p_|strike").columns
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-    df = _merge_daily_volume(df)
+    df = _merge_daily_volume(df, _ticker.ticker)
 
     # IV is the expensive part; reuse it while spot stays within threshold.
     strike_hash = _ticker._compute_strike_hash(df)
@@ -715,10 +771,10 @@ def _fetch_symbol_quote(symbol, assetclass):
     return last, prev
 
 
-def build_spot_payload():
-    """Return TSLA + SPY intraday spot series bounded to the 9:30-16:00 ET session."""
-    points = _fetch_symbol_chart("TSLA", "stocks")
-    tk = _get_ticker()
+def build_spot_payload(ticker=DEFAULT_TICKER):
+    """Return the ticker + SPY intraday spot series bounded to the 9:30-16:00 ET session."""
+    tk = _get_ticker(ticker)
+    points = _fetch_symbol_chart(tk.ticker, "stocks")
     if tk.prev_busday_close_price is None:  # populate prev close on first spot load
         try:
             tk.get_lastSalePrice()
@@ -733,7 +789,7 @@ def build_spot_payload():
     if spy_last is None and spy_points:
         spy_last = spy_points[-1][1]
     return {
-        "ticker": "TSLA",
+        "ticker": tk.ticker,
         "points": points,
         "last": points[-1][1] if points else None,
         "prevClose": _to_float(tk.prev_busday_close_price),
@@ -759,21 +815,22 @@ def _et_close_epoch_ms():
 
 # Shared short-TTL cache so many spot-stream clients don't each hit the quote API.
 _spot_lock = threading.Lock()
-_spot_cache = {"ts": 0.0, "price": None, "status": None}
+_spot_caches = {}  # ticker -> {"ts", "price", "status"}
 
 
-def get_cached_spot_price(max_age_seconds=4.0):
-    """Return (last_price, market_status), refreshing at most every few seconds."""
+def get_cached_spot_price(ticker=DEFAULT_TICKER, max_age_seconds=4.0):
+    """Return (last_price, market_status) for a ticker, refreshing every few seconds."""
+    ticker = _norm_ticker(ticker)
     now = time.time()
     with _spot_lock:
-        if _spot_cache["price"] is not None and now - _spot_cache["ts"] < max_age_seconds:
-            return _spot_cache["price"], _spot_cache["status"]
-        tk = _get_ticker()
+        c = _spot_caches.get(ticker)
+        if c is not None and c["price"] is not None and now - c["ts"] < max_age_seconds:
+            return c["price"], c["status"]
+        tk = _get_ticker(ticker)
         tk.get_lastSalePrice()
-        _spot_cache["price"] = _to_float(tk.lastSalePrice)
-        _spot_cache["status"] = tk.marketStatus
-        _spot_cache["ts"] = time.time()
-        return _spot_cache["price"], _spot_cache["status"]
+        c = {"price": _to_float(tk.lastSalePrice), "status": tk.marketStatus, "ts": time.time()}
+        _spot_caches[ticker] = c
+        return c["price"], c["status"]
 
 
 _spy_lock = threading.Lock()
