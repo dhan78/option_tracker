@@ -245,6 +245,34 @@ class DB():
             print(traceback.print_exc())
         return conn
 
+    @staticmethod
+    def snapshot_table(ticker):
+        """Per-ticker option-chain snapshot table name, e.g. TSLA -> tsla_nasdaq."""
+        t = str(ticker).strip().upper()
+        if not re.fullmatch(r"[A-Z]{1,6}", t):
+            raise ValueError(f"Invalid ticker for snapshot table: {ticker!r}")
+        return f"{t.lower()}_nasdaq"
+
+    def _create_snapshot_table(self, conn, table):
+        conn.execute(f'''
+            CREATE TABLE IF NOT EXISTS {table} (
+                load_dt TEXT,
+                load_tm TEXT,
+                expiryDate TEXT,
+                strike REAL,
+                c_Last REAL,
+                p_Last REAL,
+                c_Change REAL,
+                p_Change REAL,
+                c_Volume INTEGER,
+                p_Volume INTEGER,
+                c_Openinterest INTEGER,
+                p_Openinterest INTEGER,
+                tsla_spot_price REAL,
+                PRIMARY KEY (load_dt, load_tm, expiryDate, strike)
+            )
+        ''')
+
     def _create_tables(self, conn):
         """Create necessary tables if they don't exist"""
         try:
@@ -278,18 +306,24 @@ class DB():
             print(f"Error creating tables: {e}")
             print(traceback.print_exc())
 
-    def store_data(self,p_df, p_load_dt):
-        # import pdb; pdb.set_trace()
-
+    def store_data(self, p_df, p_load_dt, ticker="TSLA"):
+        conn = None
         try:
+            table = self.snapshot_table(ticker)
             conn = self.create_connection()
-            p_df['load_dt'] = p_load_dt
-            insert_qry = ' insert or ignore into tsla_nasdaq (' + ','.join(p_df.columns) + ') values ('+str('?,'*len(p_df.columns))[:-1] +') '
-            conn.executemany(insert_qry, p_df.to_records(index=False))
+            self._create_snapshot_table(conn, table)
+            table_cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            # Nasdaq rows carry extra fields (bid/ask, colours, URLs) the table doesn't store.
+            p_df = p_df.assign(load_dt=p_load_dt)
+            p_df = p_df[[c for c in p_df.columns if c in table_cols]]
+            insert_qry = f'insert or ignore into {table} (' + ','.join(p_df.columns) + ') values (' + ','.join('?' * len(p_df.columns)) + ')'
+            conn.executemany(insert_qry, p_df.itertuples(index=False, name=None))
             conn.commit()
-        except:
-            e = sys.exc_info()[1]
-            print(traceback.print_exc())
+        except Exception:
+            traceback.print_exc()
+        finally:
+            if conn is not None:
+                conn.close()
 
     def store_momentum_data(self,p_df, p_load_dt):
         # import pdb; pdb.set_trace()
@@ -398,7 +432,7 @@ class Ticker():
         netChange = response.json()['data']['primaryData']['netChange']
         self.marketStatus = response.json()['data']['marketStatus']
 
-        self.lastSalePrice = float(re.findall(r"\d+\.\d+", lastSalePrice)[0])
+        self.lastSalePrice = float(re.findall(r"\d+\.\d+", lastSalePrice.replace(',', ''))[0])
         
         # Calculate previous business day closing price: Last Sale Price - Net Change
         try:
@@ -580,11 +614,14 @@ class Ticker():
 # prev_bus_day_closing price: https://api.nasdaq.com/api/quote/TSLA/historical?assetclass=stocks&fromdate=2021-06-06&limit=1&todate=2021-07-06
 
     def oic_api_call(self):
-        load_dt = datetime.today().strftime('%Y-%m-%d')
-        weekly_expiry_end = weekly_expiry_target.strftime('%Y-%m-%d')
+        now = et_now()
+        load_dt = now.strftime('%Y-%m-%d')
+        # Recomputed per call so a long-running server keeps rolling the 6-week window.
+        weekly_expiry_end = (dparse.parse("Friday", default=now) + one_week * 6).strftime('%Y-%m-%d')
 
-        url = f'https://api.nasdaq.com/api/quote/{self.ticker}/option-chain?assetclass=stocks&limit=100&fromdate={load_dt}&todate={weekly_expiry_end}&excode=oprac&callput=callput&money=at&type=all'
-        response = requests.get(url, headers=get_headers())
+        # limit caps ROWS across all expiries; 100 silently dropped later expiries.
+        url = f'https://api.nasdaq.com/api/quote/{self.ticker}/option-chain?assetclass=stocks&limit=1000&fromdate={load_dt}&todate={weekly_expiry_end}&excode=oprac&callput=callput&money=at&type=all'
+        response = requests.get(url, headers=get_headers(), timeout=30)
         # Nasdaq returns data.table = null after hours / when throttled; guard the
         # whole path so a missing table degrades to "no data" instead of crashing.
         payload = response.json() if response.content else None
@@ -602,18 +639,17 @@ class Ticker():
         df['expirygroup'] = df['expirygroup'].apply(lambda x: pd.to_datetime(x))
         df['expirygroup']=df['expirygroup'].ffill(axis=0)
         df.dropna(inplace=True)
-        df['load_dt'] = datetime.today().strftime('%Y-%m-%d')
-        df['load_tm'] = datetime.today().strftime('%H:%M:%S')
-        if self.marketStatus =='Market Open':  # Save data only during market hours
-            try:
-                if (datetime.today()-self.lastDataStoreTime).seconds/60 > 15:
-                    df.drop(['expirygroup','c_colour','p_colour','drillDownURL'],axis=1,inplace=True)
-                    df['tsla_spot_price'] = self.lastSalePrice
-                    db.store_data(p_df=df, p_load_dt=load_dt)
-                    print('Saved data to file')
-                    self.lastDataStoreTime = datetime.today()
-            except :
+        # Nasdaq formats values >= 1,000 with commas, which to_numeric would turn into NaN.
+        num_cols = df.filter(regex="^(c_|p_|strike)").columns.difference(['c_colour', 'p_colour'])
+        df[num_cols] = df[num_cols].apply(lambda s: s.astype(str).str.replace(',', '', regex=False))
+        df['load_dt'] = load_dt
+        df['load_tm'] = now.strftime('%H:%M:%S')
+        # Nasdaq reports "Open" (older responses: "Market Open"); skip pre/after-hours.
+        if 'open' in str(self.marketStatus).lower():
+            if self.lastDataStoreTime is None or (datetime.today()-self.lastDataStoreTime).total_seconds()/60 > 15:
                 self.lastDataStoreTime = datetime.today()
+                db.store_data(p_df=df.assign(tsla_spot_price=self.lastSalePrice), p_load_dt=load_dt, ticker=self.ticker)
+                print(f'Saved {self.ticker} snapshot to file')
 
 
         return df
@@ -655,7 +691,7 @@ class Nasdaq_Leap():
         df['color']=df.expirygroup.map(dict_color)
 
         df[df.filter(regex='c_|p_|strike').columns] = df.filter(regex='c_|p_|strike').\
-            apply(pd.to_numeric,errors='coerce')
+            apply(lambda s: pd.to_numeric(s.astype(str).str.replace(',', '', regex=False), errors='coerce'))
         df=df[df.strike>160].copy()
         print (f'{get_evenly_divided_values.__name__} : finished Data Manipulation')
         self.df, self.dict_color = df, dict_color

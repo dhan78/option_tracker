@@ -5,7 +5,7 @@ Highcharts.setOptions({ chart: { animation: false, resetZoomButton: { position: 
 const REFRESH_MS = 30000; // polling fallback only; primary transport is WebSocket
 const state = {
   charts: new Map(), byExpiry: new Map(), leftMax: { oi: null, vol: null },
-  heatmap: null, smile: null, current: null, polling: false, ivCache: new Map(), highlight: null, spot: null, gex: null, gexCurve: null, charm: null, blendK: 0.3, pinHistory: [], pinChart: null, ivChart: null, ivStats: null,
+  heatmap: null, smile: null, current: null, polling: false, ivCache: new Map(), highlight: null, spot: null, gex: null, gexCurve: null, charm: null, blendK: 0.3, pinHistory: [], pinChart: null, ivChart: null, ivStats: null, ivDaily: [],
 };
 
 // Ticker is URL-driven so separate browser tabs (?ticker=TSLA, ?ticker=SPCX) stay independent.
@@ -216,7 +216,7 @@ function attachReset(chart, kind) {
 function leftChart(el, exp) {
   return Highcharts.chart(el, {
     chart: { zoomType: "x", spacingTop: 24, events: { load() { attachReset(this, "left"); } } },
-    title: { text: exp.expiry, align: "left", style: { fontSize: "13px" } },
+    title: { text: expiryTitle(exp.expiry), align: "left", style: { fontSize: "13px" } },
     credits: { enabled: false },
     legend: { enabled: false },
     xAxis: strikeAxis(leftPlotLines(exp)),
@@ -622,24 +622,33 @@ function ivBands() {
   return [{ from: Math.min(...ivs), to: Math.max(...ivs), color: "rgba(180,120,0,0.06)" }];
 }
 
+// Prior-day IV closes from the DB — seeds a multi-day trend so the chart isn't empty after a restart.
+function ivDailyData() {
+  return (state.ivDaily || []).filter((p) => p.close != null).map((p) => [p.t, p.close]);
+}
+
 function buildIvHistory() {
   state.ivChart = Highcharts.chart("iv-history", {
-    chart: { type: "spline", height: 170, spacingTop: 10 },
+    chart: { type: "spline", height: 170, spacingTop: 10, zoomType: "x" },
     title: { text: "ATM IV (front expiry)", align: "left", style: { fontSize: "12px" } },
     credits: { enabled: false },
-    legend: { enabled: false },
-    xAxis: { type: "datetime", crosshair: true },
+    legend: { enabled: true, itemStyle: { fontSize: "9px" } },
+    xAxis: { type: "datetime", crosshair: true, plotLines: ivEarnLines() },
     yAxis: { title: { text: "IV %" }, plotBands: ivBands() },
-    tooltip: { xDateFormat: "%H:%M:%S", valueSuffix: "%", valueDecimals: 1 },
-    plotOptions: { series: { lineWidth: 2, marker: { enabled: false }, color: "#b26a00" } },
-    series: [{ name: "ATM IV", data: pinData("atm_iv") }],
+    tooltip: { xDateFormat: "%b %e, %H:%M", valueSuffix: "%", valueDecimals: 1 },
+    plotOptions: { series: { lineWidth: 2, marker: { enabled: false } } },
+    series: [
+      { name: "Daily close", color: "#8a8a8a", dashStyle: "ShortDash", lineWidth: 1.5, marker: { enabled: true, radius: 2 }, data: ivDailyData() },
+      { name: "Today (intraday)", color: "#b26a00", data: pinData("atm_iv") },
+    ],
   });
 }
 
 function updateIvHistory() {
   if (!document.getElementById("iv-history")) return;
   if (!state.ivChart) { buildIvHistory(); return; }
-  state.ivChart.series[0].setData(pinData("atm_iv"), false);
+  state.ivChart.series[0].setData(ivDailyData(), false);
+  state.ivChart.series[1].setData(pinData("atm_iv"), false);
   state.ivChart.yAxis[0].update({ plotBands: ivBands() }, false);
   state.ivChart.redraw();
 }
@@ -768,18 +777,49 @@ function updateCharm(payload) {
 }
 
 // ── Wheel scanner: sortable CSP / covered-call candidate table ───────
-state.wheel = { rows: [], sortKey: "ann_roc", sortDir: -1, side: "all", minPop: 0, minDte: 1, maxDte: 60 };
+state.wheel = { rows: [], sortKey: "ann_roc", sortDir: -1, side: "all", minPop: 0, minDte: 1, maxDte: 2, hideEarn: false, expiry: "next" };
 const WHEEL_COLS = [
   ["side", "Side"], ["expiry", "Expiry"], ["strike", "Strike"], ["dte", "DTE"],
-  ["delta", "Δ"], ["pop", "PoP%"], ["bid", "Bid"], ["ann_roc", "Ann ROC%"],
+  ["delta", "Δ"], ["pop", "PoP%"], ["pot", "PoT%"], ["bid", "Bid"], ["ann_roc", "Ann ROC%"],
   ["breakeven", "Breakeven"], ["cushion", "Cushion%"],
 ];
 
+// Expiries that have candidates, nearest first.
+function wheelExpiries() {
+  const dte = new Map();
+  state.wheel.rows.forEach((r) => { if (!dte.has(r.expiry)) dte.set(r.expiry, r.dte); });
+  return [...dte.entries()].sort((a, b) => a[1] - b[1]);
+}
+
+// "next" = nearest expiry with DTE >= min DTE (set min 0 to include same-day expiries).
+function wheelNextExpiry() {
+  const hit = wheelExpiries().find(([, d]) => d >= state.wheel.minDte);
+  return hit ? hit[0] : null;
+}
+
+function syncWheelExpirySelect() {
+  const sel = document.getElementById("w-expiry");
+  if (!sel) return;
+  const exps = wheelExpiries();
+  const key = exps.map(([e]) => e).join(",");
+  if (sel.dataset.key === key) return;
+  sel.dataset.key = key;
+  const cur = state.wheel.expiry;
+  sel.innerHTML = `<option value="next">Next expiry</option><option value="range">DTE range</option>` +
+    exps.map(([e, d]) => `<option value="${e}">${e} (${d}d)</option>`).join("");
+  if (cur !== "next" && cur !== "range" && !exps.some(([e]) => e === cur)) state.wheel.expiry = "next"; // expired
+  sel.value = state.wheel.expiry;
+}
+
 function wheelFiltered() {
   const w = state.wheel;
+  const nextExp = w.expiry === "next" ? wheelNextExpiry() : null;
+  const expOk = (r) => (w.expiry === "range" ? r.dte >= w.minDte && r.dte <= w.maxDte
+    : r.expiry === (w.expiry === "next" ? nextExp : w.expiry));
   const rows = w.rows.filter((r) =>
     (w.side === "all" || r.side === w.side) &&
-    r.pop >= w.minPop && r.dte >= w.minDte && r.dte <= w.maxDte);
+    r.pop >= w.minPop && expOk(r) &&
+    !(w.hideEarn && earnIcon(earnFlag(r.expiry))));
   const k = w.sortKey, d = w.sortDir;
   rows.sort((a, b) => (a[k] < b[k] ? -d : a[k] > b[k] ? d : 0));
   return rows;
@@ -796,18 +836,22 @@ function wheelRowClass(r) {
 function renderWheel() {
   const el = document.getElementById("wheel-table");
   if (!el) return;
+  syncWheelExpirySelect();
   const rows = wheelFiltered();
   const cnt = document.getElementById("wheel-count");
-  if (cnt) cnt.textContent = `${rows.length} candidates`;
+  const nx = state.wheel.expiry === "next" ? wheelNextExpiry() : null;
+  if (cnt) cnt.textContent = `${rows.length} candidates${nx ? " \u00b7 " + nx : ""}`;
   const w = state.wheel;
   const arrow = (k) => (k === w.sortKey ? (w.sortDir < 0 ? " ▾" : " ▴") : "");
   let h = '<table class="wheel"><thead><tr>';
   WHEEL_COLS.forEach(([k, l]) => { h += `<th data-k="${k}" class="w-sort">${l}${arrow(k)}</th>`; });
   h += "</tr></thead><tbody>";
   rows.forEach((r) => {
+    const ef = earnFlag(r.expiry);
+    const earn = earnIcon(ef) ? ` <span class="w-earn" title="${ef === "event" ? "earnings expiry: first to settle after the report" : "earnings expiry only if the unconfirmed date lands early"}">${earnIcon(ef)}</span>` : "";
     h += `<tr class="${wheelRowClass(r)}">` +
-      `<td>${r.side}</td><td>${r.expiry}</td><td>${fmt(r.strike, 1)}</td><td>${r.dte}</td>` +
-      `<td>${fmt(r.delta, 2)}</td><td>${fmt(r.pop, 0)}</td><td>${fmt(r.bid, 2)}</td>` +
+      `<td>${r.side}</td><td>${r.expiry}${earn}</td><td>${fmt(r.strike, 1)}</td><td>${r.dte}</td>` +
+      `<td>${fmt(r.delta, 2)}</td><td>${fmt(r.pop, 0)}</td><td>${fmt(r.pot, 0)}</td><td>${fmt(r.bid, 2)}</td>` +
       `<td><b>${fmt(r.ann_roc, 0)}</b></td><td>${fmt(r.breakeven, 2)}</td>` +
       `<td>${fmt(r.cushion, 1)}${r.beyond_move ? ' <span class="w-out" title="beyond 2σ expected move">⚠</span>' : ""}</td></tr>`;
   });
@@ -854,10 +898,10 @@ function ladderChart(el, exp, wheel) {
   const rows = (wheel || []).filter((r) => r.expiry === exp.expiry);
   return Highcharts.chart(el, {
     chart: { type: "line", spacingTop: 24, zoomType: "xy" },
-    title: { text: exp.expiry + " \u00b7 Yield (ann ROC%) \u2014 bid vs t-1", align: "left", style: { fontSize: "13px" } },
+    title: { text: expiryTitle(exp.expiry) + LADDER_TITLE, align: "left", style: { fontSize: "13px" } },
     credits: { enabled: false },
     legend: { enabled: true, itemStyle: { fontSize: "9px" } },
-    xAxis: { title: { text: null }, crosshair: true, plotLines: expiryLadderPlotLines(exp) },
+    xAxis: { title: { text: null }, crosshair: true, plotLines: expiryLadderPlotLines(exp), plotBands: earnBands(exp) },
     yAxis: { title: { text: "Ann ROC %" }, min: 0 },
     tooltip: {
       useHTML: true, headerFormat: "",
@@ -874,7 +918,7 @@ function updateExpiryLadder(exp, wheel) {
   if (!pair || !pair.ladder) return;
   const rows = (wheel || []).filter((r) => r.expiry === exp.expiry);
   ladderSeries(rows).forEach((cfg, i) => pair.ladder.series[i].setData(cfg.data, false));
-  pair.ladder.xAxis[0].update({ plotLines: expiryLadderPlotLines(exp) }, false);
+  pair.ladder.xAxis[0].update({ plotLines: expiryLadderPlotLines(exp), plotBands: earnBands(exp) }, false);
   pair.ladder.redraw();
 }
 
@@ -896,7 +940,227 @@ function updateWheel(payload) {
   bind("w-pop", "minPop", true);
   bind("w-mindte", "minDte", true);
   bind("w-maxdte", "maxDte", true);
+  bind("w-expiry", "expiry", false);
+  const he = document.getElementById("w-hide-earn");
+  if (he) he.addEventListener("change", () => { state.wheel.hideEarn = he.checked; renderWheel(); });
 })();
+
+// ── Earnings: next report, EPS history/forecast, expiry event flags ─────
+state.earn = null;
+state.epsChart = null;
+const LADDER_TITLE = " \u00b7 Yield (ann ROC%) \u2014 bid vs t-1";
+const MONTH_IDX = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+
+const escHtml = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// "Oct-30-2026" -> "2026-10-30" so expiries compare against the ISO earnings dates.
+function expiryISO(label) {
+  const [m, d, y] = String(label).split("-");
+  return `${y}-${String(MONTH_IDX[m] + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+const isoShort = (iso) => new Date(iso + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" });
+
+// "event" = first expiry settling after the report; "spans" = a later one (holds through it, unmarked);
+// "maybe" = only an earnings expiry if an unconfirmed date lands early in its window.
+function earnFlag(expiryLabel) {
+  const n = state.earn && state.earn.next;
+  if (!n || n.days_to < 0) return null;
+  const iso = expiryISO(expiryLabel);
+  if (iso < n.event_day_earliest) return null;
+  if (iso < n.event_day_latest) return "maybe";
+  const post = ((state.current && state.current.expiries) || []).map((e) => expiryISO(e.expiry))
+    .filter((d) => d >= n.event_day_latest).sort()[0];
+  return !post || iso === post ? "event" : "spans";
+}
+
+const earnIcon = (flag) => (flag === "event" ? "\u26a1" : flag === "maybe" ? "\u26a1?" : "");
+
+function expiryTitle(label) {
+  const ic = earnIcon(earnFlag(label));
+  return ic ? `${label} ${ic} earnings` : label;
+}
+
+// Event-only 1σ move: post-event variance minus pre-event variance minus the normal days in between.
+function earnImpliedMove() {
+  const n = state.earn && state.earn.next, p = state.current;
+  if (!n || n.days_to < 0 || !p || !p.expiries) return null;
+  const xs = p.expiries.filter((e) => e.atm && e.atm.avg_iv != null && e.bus_days);
+  const iv = (e) => e.atm.avg_iv / 100;
+  const v = (e) => iv(e) ** 2 * (e.bus_days / 252);
+  const pre = xs.filter((e) => expiryISO(e.expiry) < n.event_day_earliest).pop();
+  const postIdx = xs.findIndex((e) => expiryISO(e.expiry) >= n.event_day_latest);
+  if (postIdx < 0) return null;
+  const post = xs[postIdx];
+  let ev;
+  if (pre) {
+    ev = v(post) - v(pre) - iv(pre) ** 2 * Math.max(post.bus_days - pre.bus_days - 1, 0) / 252;
+  } else {
+    // Event before the front expiry: take normal vol from the forward between the next two expiries.
+    const nxt = xs[postIdx + 1];
+    if (!nxt || nxt.bus_days <= post.bus_days) return null;
+    const fwdVar = (v(nxt) - v(post)) / ((nxt.bus_days - post.bus_days) / 252);
+    ev = v(post) - fwdVar * Math.max(post.bus_days - 1, 0) / 252;
+  }
+  if (!(ev > 0)) return null;
+  const sd = Math.sqrt(ev);
+  return { move: p.lastSalePrice * sd, pct: sd * 100, pre: pre ? pre.expiry : null, post: post.expiry };
+}
+
+function earningsBadgeHTML() {
+  const e = state.earn, n = e && e.next;
+  if (!n || n.days_to < 0) return "";
+  const when = n.confirmed
+    ? `${isoShort(n.date)}${n.timing ? " " + n.timing : ""}`
+    : `~${isoShort(n.date)} est. (window ${isoShort(n.window_start)}\u2013${isoShort(n.date)})`;
+  const q = (e.quarterly || [])[0];
+  const rev = q ? (q.down ? ` \u2193${q.down}` : q.up ? ` \u2191${q.up}` : "") : "";
+  const cons = q && q.consensus != null ? ` \u00b7 cons $${fmt(q.consensus)}${rev}` : "";
+  const m = earnImpliedMove();
+  const mv = m ? ` \u00b7 event 1\u03c3 \u00b1$${fmt(m.move, 0)} (${fmt(m.pct, 1)}%)` : "";
+  const cls = n.days_to <= 7 ? "near" : n.days_to <= 21 ? "soon" : "";
+  const tip = m ? `${n.text}\n\nEvent move from ${m.pre || "forward vol"} \u2192 ${m.post} ATM IV term structure.` : n.text;
+  return `<span class="earn-badge ${cls}" title="${escHtml(tip)}">\u26a1 Earnings ${when} \u00b7 ${n.days_to}d${cons}${mv}</span>`;
+}
+
+// Shaded ±event-move band on the yield ladders of expiries that span the report.
+function earnBands(exp) {
+  const m = earnIcon(earnFlag(exp.expiry)) ? earnImpliedMove() : null;
+  if (!m || window.__lastPrice == null) return [];
+  const S = window.__lastPrice;
+  return [{ from: S - m.move, to: S + m.move, color: "rgba(255,193,7,0.13)", zIndex: 0,
+    label: { text: `\u26a1 event \u00b11\u03c3 $${fmt(m.move, 0)}`, align: "center", verticalAlign: "bottom", y: -4,
+      style: { fontSize: "9px", color: "#b26a00", fontWeight: "bold", textOutline: "2px #fff" } } }];
+}
+
+// Report dates as plotLines on the daily ATM-IV chart (4pm ET encoded as UTC, matching its x values).
+function ivEarnLines() {
+  const e = state.earn;
+  if (!e) return [];
+  const at = (iso) => { const [y, m, d] = iso.split("-").map(Number); return Date.UTC(y, m - 1, d, 16); };
+  const dates = (e.history || []).map((h) => h.reported).filter(Boolean);
+  if (e.next) dates.push(e.next.date);
+  return dates.map((iso) => ({ value: at(iso), color: "#b26a00", dashStyle: "ShortDot", width: 1, zIndex: 3,
+    label: { text: `\u26a1 ${isoShort(iso)}`, rotation: 0, y: 10, style: { fontSize: "9px", color: "#b26a00" } } }));
+}
+
+const qShort = (s) => { const [m, y] = String(s).split(" "); return `${m}'${String(y || "").slice(2)}`; };
+
+function buildEpsChart(e) {
+  const past = e.history || [];
+  const fut = (e.quarterly || []).filter((q) => !past.some((h) => h.quarter === q.period));
+  const np = past.length;
+  const cats = past.map((h) => qShort(h.quarter)).concat(fut.map((q) => qShort(q.period)));
+  const revLabel = (q) => (q.down ? `\u2193${q.down}` : q.up ? `\u2191${q.up}` : "");
+  const n = e.next;
+  const nextText = n ? `Next: ${isoShort(n.date)}${n.confirmed ? "" : " (est.)"}` : "Next";
+  if (state.epsChart) { state.epsChart.destroy(); state.epsChart = null; }
+  state.epsChart = Highcharts.chart("eps-chart", {
+    chart: { height: 260, spacingTop: 14 },
+    title: { text: `${e.ticker} EPS \u2014 reported vs consensus`, align: "left", style: { fontSize: "12px" } },
+    credits: { enabled: false },
+    legend: { enabled: true, itemStyle: { fontSize: "9px" } },
+    xAxis: { categories: cats, crosshair: true,
+      plotLines: np && fut.length ? [{ value: np - 0.5, color: "#b26a00", dashStyle: "Dash", width: 1.5, zIndex: 4,
+        label: { text: nextText, rotation: 0, y: 12, style: { fontSize: "10px", color: "#b26a00", fontWeight: "bold", textOutline: "2px #fff" } } }] : [] },
+    yAxis: [
+      { title: { text: "EPS $" }, plotLines: [{ value: 0, color: "#bbb", width: 1 }] },
+      { title: { text: "Surprise %" }, opposite: true, gridLineWidth: 0, plotLines: [{ value: 0, color: "#ddd", width: 1 }] },
+    ],
+    tooltip: {
+      shared: true, useHTML: true,
+      formatter() {
+        // Scatter series don't join shared tooltips, so a point may arrive alone.
+        const i = (this.point || this.points[0].point).x;
+        if (i < np) {
+          const h = past[i];
+          return `<b>${escHtml(h.quarter)}</b> \u00b7 reported ${h.reported ? isoShort(h.reported) : "\u2014"}<br/>` +
+            `EPS <b>$${fmt(h.eps)}</b> vs cons $${fmt(h.consensus)}<br/>` +
+            `Surprise <b style="color:${h.surprise_pct >= 0 ? "rgb(0,128,0)" : "rgb(210,0,0)"}">${fmt(h.surprise_pct, 1)}%</b>`;
+        }
+        const q = fut[i - np];
+        return `<b>${escHtml(q.period)}</b> (forecast)<br/>Consensus <b>$${fmt(q.consensus)}</b><br/>` +
+          `Range $${fmt(q.low)} \u2013 $${fmt(q.high)} \u00b7 ${fmt(q.estimates, 0)} est.<br/>` +
+          `Revisions 4w: \u2191${fmt(q.up, 0)} / \u2193${fmt(q.down, 0)}`;
+      },
+    },
+    series: [
+      { name: "Surprise %", type: "column", yAxis: 1, zIndex: 0, borderWidth: 0, pointPadding: 0.25,
+        data: past.map((h, i) => ({ x: i, y: h.surprise_pct, color: h.surprise_pct >= 0 ? "rgba(0,128,0,0.25)" : "rgba(210,0,0,0.25)" })) },
+      { name: "Analyst range", type: "errorbar", color: "#8a8a8a", whiskerLength: 10, data: fut.map((q, j) => [np + j, q.low, q.high]) },
+      { name: "Consensus", type: "scatter", zIndex: 4, color: "#2451c7",
+        marker: { symbol: "circle", radius: 5, fillColor: "#fff", lineWidth: 2, lineColor: "#2451c7" },
+        data: past.map((h, i) => ({ x: i, y: h.consensus })).concat(fut.map((q, j) => ({ x: np + j, y: q.consensus,
+          dataLabels: { enabled: !!revLabel(q), format: revLabel(q), style: { fontSize: "9px", color: q.down ? "#b40426" : "#1a7f37", textOutline: "2px #fff" } } }))) },
+      { name: "Actual", type: "scatter", zIndex: 5, color: "#222", marker: { symbol: "circle", radius: 5 },
+        data: past.map((h, i) => ({ x: i, y: h.eps })) },
+    ],
+  });
+}
+
+function renderEarnTable(e) {
+  const el = document.getElementById("earn-table");
+  if (!el) return;
+  const sCls = (v) => (v == null ? "" : v < 0 ? "neg" : "pos");
+  let h = '<table class="earn"><thead><tr><th>Quarter</th><th>Reported</th><th>EPS</th><th>Consensus</th><th>Surprise</th><th>Range</th><th>Rev 4w</th></tr></thead><tbody>';
+  (e.history || []).forEach((r) => {
+    h += `<tr><td>${escHtml(r.quarter)}</td><td>${r.reported ? isoShort(r.reported) : "\u2014"}</td><td>$${fmt(r.eps)}</td>` +
+      `<td>$${fmt(r.consensus)}</td><td class="${sCls(r.surprise_pct)}">${fmt(r.surprise_pct, 1)}%</td><td></td><td></td></tr>`;
+  });
+  const past = new Set((e.history || []).map((r) => r.quarter));
+  (e.quarterly || []).filter((q) => !past.has(q.period)).forEach((q, i) => {
+    const rep = i === 0 && e.next ? `${isoShort(e.next.date)}${e.next.confirmed ? "" : " est."}` : "";
+    h += `<tr class="fut"><td>${escHtml(q.period)}</td><td>${rep}</td><td></td><td>$${fmt(q.consensus)}</td><td></td>` +
+      `<td>$${fmt(q.low)}\u2013$${fmt(q.high)}</td><td>\u2191${fmt(q.up, 0)} \u2193${fmt(q.down, 0)}</td></tr>`;
+  });
+  const y = (e.yearly || [])[0];
+  if (y) h += `<tr class="fut"><td>FY ${escHtml(y.period)}</td><td></td><td></td><td>$${fmt(y.consensus)}</td><td></td><td>$${fmt(y.low)}\u2013$${fmt(y.high)}</td><td>\u2191${fmt(y.up, 0)} \u2193${fmt(y.down, 0)}</td></tr>`;
+  el.innerHTML = h + "</tbody></table>";
+}
+
+// Re-apply earnings decorations to charts that were built before (or without) the earnings data.
+function applyEarnDecor() {
+  if (state.current) renderStatus(state.current);
+  renderWheel();
+  state.charts.forEach((pair, label) => {
+    const exp = state.byExpiry.get(label);
+    if (pair.left) pair.left.setTitle({ text: expiryTitle(label) });
+    if (pair.ladder && exp) {
+      pair.ladder.setTitle({ text: expiryTitle(label) + LADDER_TITLE }, false);
+      pair.ladder.xAxis[0].update({ plotBands: earnBands(exp) });
+    }
+  });
+  if (state.ivChart) state.ivChart.xAxis[0].update({ plotLines: ivEarnLines() });
+}
+
+function renderEarnings() {
+  const panel = document.getElementById("earnings-panel");
+  const e = state.earn;
+  if (panel) panel.style.display = e ? "" : "none";
+  if (e) {
+    buildEpsChart(e);
+    renderEarnTable(e);
+    const sum = document.getElementById("earn-summary");
+    const streak = (e.history || []).slice().reverse();
+    let k = 0;
+    while (k < streak.length && streak[k].surprise_pct != null && streak[k].surprise_pct < 0) k++;
+    if (sum) sum.textContent = k >= 2 ? `\u00b7 ${k} straight misses` : "";
+  }
+  applyEarnDecor();
+}
+
+async function loadEarnings() {
+  try {
+    const r = await fetch(qTicker("/api/earnings"));
+    const e = await r.json();
+    if (!r.ok) return;
+    state.earn = e && e.available ? e : null;
+    renderEarnings();
+  } catch (err) { /* keep last view */ }
+}
+
+const earningsPanel = document.getElementById("earnings-panel");
+if (earningsPanel) earningsPanel.addEventListener("toggle", () => { if (earningsPanel.open && state.epsChart) state.epsChart.reflow(); });
 
 // Adjusted-OI blend: recompute GEX + charm off the cached chain at OI + k·volume.
 async function applyBlend() {
@@ -908,6 +1172,7 @@ async function applyBlend() {
     updateCharm({ gex: d.gex, charm: d.charm });
     if (d.pin_history) { state.pinHistory = d.pin_history; updatePinHistory(); } // server-persisted
     if (d.iv_stats) state.ivStats = d.iv_stats;
+    if (d.iv_daily) state.ivDaily = d.iv_daily;
     updateIvHistory();
     ivBadge();
   } catch (e) { /* keep last view on transient failure */ }
@@ -967,7 +1232,8 @@ function renderStatus(payload) {
     (chg != null ? `<span class="${cls}">${sign}${fmt(chg)}${pct != null ? ` (${sign}${fmt(pct)}%)` : ""}</span>` : "") +
     `<span class="muted">Source: ${payload.dataSource || "—"}</span>` +
     `<span class="muted">Market: ${payload.marketStatus || "—"}</span>` +
-    `<span class="muted">Updated: ${payload.timestamp}</span>`;
+    `<span class="muted">Updated: ${payload.timestamp}</span>` +
+    earningsBadgeHTML();
 }
 
 function render(payload, changed) {
@@ -985,11 +1251,16 @@ function render(payload, changed) {
 let lastUpdateAt = Date.now();
 state.cadenceMs = 15000; // WS push cadence; polling fallback overrides to REFRESH_MS
 function markUpdated() { lastUpdateAt = Date.now(); }
+const clockFmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
 setInterval(() => {
-  const label = document.getElementById("refresh-label");
-  if (!label) return;
-  const remaining = Math.max(0, state.cadenceMs - (Date.now() - lastUpdateAt));
-  label.textContent = `next refresh ~${Math.ceil(remaining / 1000)}s`;
+  const label = document.getElementById("refresh-countdown");
+  if (label) {
+    const remaining = Math.max(0, state.cadenceMs - (Date.now() - lastUpdateAt));
+    label.textContent = `next refresh ~${Math.ceil(remaining / 1000)}s`;
+  }
+  const toggle = document.getElementById("clock-toggle");
+  const clock = document.getElementById("live-clock");
+  if (toggle && clock) clock.textContent = toggle.checked ? `${clockFmt.format(new Date())} ET` : "";
 }, 250);
 
 // Merge a per-expiry delta into the cached payload, then re-render only what changed.
@@ -1532,3 +1803,5 @@ if (spotPanel) {
 if (!spotPanel || spotPanel.open) startSpot();
 
 connectWS();
+loadEarnings();
+setInterval(loadEarnings, 3600000);

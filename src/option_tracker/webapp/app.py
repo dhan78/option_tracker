@@ -32,7 +32,9 @@ from option_tracker.webapp.data import (
     get_pin_history,
     record_iv_daily,
     get_iv_stats,
+    get_iv_daily_history,
     get_tracked_tickers,
+    get_cached_earnings,
     DEFAULT_TICKER,
 )
 
@@ -180,10 +182,16 @@ def api_gex(k: float = Query(0.0, ge=0.0, le=2.0), ticker: str = Query(DEFAULT_T
             "charm": _compute_charm(expiries, spot, blend_k=k),
             "pin_history": get_pin_history(ticker),
             "iv_stats": get_iv_stats(atm_iv, ticker),
+            "iv_daily": get_iv_daily_history(ticker),
         }
     except Exception as exc:
         traceback.print_exc()
         return JSONResponse(status_code=502, content={"error": str(exc)})
+
+
+@app.get("/api/earnings")
+def api_earnings(ticker: str = Query(DEFAULT_TICKER)):
+    return get_cached_earnings(ticker)
 
 
 @app.get("/api/leap")

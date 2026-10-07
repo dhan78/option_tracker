@@ -47,6 +47,9 @@ body {
 .status-bar .down { color: var(--put); font-size: 13px; }
 
 #refresh-label { padding: 2px 18px 8px; font-size: 11px; color: #667; }
+#refresh-label .clock-toggle { margin-left: 12px; cursor: pointer; user-select: none; }
+#refresh-label .clock-toggle input { vertical-align: middle; margin: 0 2px 0 0; }
+#live-clock { margin-left: 8px; font: bold 14px ui-monospace, Consolas, monospace; color: #222; }
 .calc-link-row { padding: 0 18px 8px; }
 .calc-link-row a { font-size: 12px; color: #0d6efd; text-decoration: none; }
 .calc-link-row a:hover { text-decoration: underline; }
@@ -124,6 +127,19 @@ table.wheel tr.w-d30 { background: #fff7e6; }
 table.wheel tr.w-d16 { background: #eaf6ea; }
 table.wheel tr:hover { background: #eef4fb; }
 .w-out { color: #d9822b; cursor: help; }
+.w-earn { color: #b26a00; font-weight: bold; cursor: help; }
+.wheel-controls input[type=checkbox] { width: auto; vertical-align: middle; }
+.earn-badge { font-weight: 600; font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #f0f0f0; color: #555; cursor: help; }
+.earn-badge.soon { background: #fff4e5; color: #b26a00; }
+.earn-badge.near { background: #fdeaea; color: #b40426; }
+#earn-table { padding: 0 12px 6px; overflow: auto; }
+table.earn { border-collapse: collapse; width: 100%; font-size: 12px; }
+table.earn th { background: #f4f6f8; padding: 4px 8px; text-align: right; white-space: nowrap; border-bottom: 1px solid #dde; }
+table.earn td { padding: 3px 8px; text-align: right; border-bottom: 1px solid #f0f2f4; white-space: nowrap; }
+table.earn th:first-child, table.earn td:first-child { text-align: left; }
+table.earn tr.fut td { color: #556; font-style: italic; }
+table.earn .neg { color: var(--put); font-weight: 600; }
+table.earn .pos { color: var(--call); font-weight: 600; }
 .spinner {
   display: inline-block; width: 16px; height: 16px; margin-right: 8px;
   border: 3px solid #cfd8e3; border-top-color: #0d6efd; border-radius: 50%;

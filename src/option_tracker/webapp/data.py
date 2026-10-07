@@ -33,7 +33,6 @@ from option_tracker.utils.pc_utils import (
     Ticker,
     Nasdaq_Leap,
     db,
-    run_dt_yyyy_mm_dd,
     get_risk_free_rate,
     get_headers,
     et_now,
@@ -229,6 +228,34 @@ def get_iv_stats(current_iv=None, ticker=DEFAULT_TICKER, lookback_days=252):
     return stats
 
 
+def get_iv_daily_history(ticker=DEFAULT_TICKER, days=60):
+    """Prior-day ATM-IV closes/highs/lows (excludes today) to seed the IV chart after a restart."""
+    ticker = _norm_ticker(ticker)
+    today = et_now().strftime("%Y-%m-%d")
+    with _iv_db_lock:
+        conn = _iv_db_conn()
+        try:
+            rows = conn.execute(
+                "SELECT date, iv_high, iv_low, iv_close FROM iv_daily WHERE ticker=? AND date<? ORDER BY date DESC LIMIT ?",
+                (ticker, today, days),
+            ).fetchall()
+        except Exception:
+            traceback.print_exc()
+            rows = []
+        finally:
+            conn.close()
+    out = []
+    for d, hi, lo, cl in reversed(rows):  # chronological order for plotting
+        try:
+            y, mo, dd = (int(x) for x in d.split("-"))
+            # 4pm ET encoded as UTC ms, matching the intraday chart's timestamp convention.
+            t = datetime(y, mo, dd, 16, 0, tzinfo=timezone.utc).timestamp() * 1000.0
+        except Exception:
+            continue
+        out.append({"t": t, "high": _to_float(hi), "low": _to_float(lo), "close": _to_float(cl)})
+    return out
+
+
 # Reuse Black-Scholes IV across cycles while spot barely moves (recompute anchor).
 IV_PRICE_THRESHOLD = 0.50
 _iv_states = {}  # ticker -> {"price", "date", "strike_hash", "by_expiry"}
@@ -295,22 +322,22 @@ def _expiry_label(key):
 def _merge_daily_volume(df, ticker=DEFAULT_TICKER):
     """Attach start-of-day volume so daily volume = current - open snapshot.
 
-    Only TSLA has an intraday snapshot table (``tsla_nasdaq``); other tickers fall
-    back to total volume.
+    Uses the ticker's first snapshot today (``<ticker>_nasdaq``); falls back to
+    total volume when there is none yet.
     """
-    if _norm_ticker(ticker) != "TSLA":
-        df["c_Volume_1"] = df["c_Volume"]
-        df["p_Volume_1"] = df["p_Volume"]
-        return df
     try:
+        table = db.snapshot_table(_norm_ticker(ticker))
+        today = et_now().strftime("%Y-%m-%d")
         df_vol = db.query_sql_data(
-            "with st_tm as (select min(load_tm) as tm from tsla_nasdaq "
-            f"where load_dt = '{run_dt_yyyy_mm_dd}') "
-            "select * from st_tm, tsla_nasdaq "
-            f"where load_dt = '{run_dt_yyyy_mm_dd}' and load_tm = st_tm.tm"
+            f"with st_tm as (select min(load_tm) as tm from {table} "
+            f"where load_dt = '{today}') "
+            f"select * from st_tm, {table} "
+            f"where load_dt = '{today}' and load_tm = st_tm.tm"
         )
-        df_vol["p_Volume_1"] = pd.to_numeric(df_vol["p_Volume"].astype(str), errors="coerce").fillna(0)
-        df_vol["c_Volume_1"] = pd.to_numeric(df_vol["c_Volume"].astype(str), errors="coerce").fillna(0)
+        num = lambda s: pd.to_numeric(s.astype(str).str.replace(",", "", regex=False), errors="coerce")
+        df_vol["p_Volume_1"] = num(df_vol["p_Volume"]).fillna(0)
+        df_vol["c_Volume_1"] = num(df_vol["c_Volume"]).fillna(0)
+        df_vol["strike"] = num(df_vol["strike"])
         df = df.merge(
             df_vol[["expiryDate", "strike", "p_Volume_1", "c_Volume_1"]],
             on=["expiryDate", "strike"],
@@ -348,6 +375,18 @@ def _bs_call_delta(S, K, T, sigma, r):
     return _ncdf(d1)
 
 
+def _prob_touch(S, H, T, sigma, r):
+    """Risk-neutral probability spot trades through barrier H before T (GBM, reflection principle)."""
+    if S <= 0 or H <= 0 or sigma <= 0 or T <= 0:
+        return None
+    vs = sigma * math.sqrt(T)
+    nu = r - 0.5 * sigma * sigma
+    x = math.log(S / H)
+    p = _ncdf((x + nu * T) / vs) if H > S else _ncdf((-x - nu * T) / vs)
+    p += (H / S) ** (2 * nu / (sigma * sigma)) * (_ncdf((x - nu * T) / vs) if H > S else _ncdf((-x + nu * T) / vs))
+    return min(max(p, 0.0), 1.0)
+
+
 def _expiry_walls(g, spot, bus_days):
     """Per-expiry gamma walls: strikes of max (+) and min (-) net GEX for one expiry."""
     if not spot or spot <= 0 or not bus_days or bus_days <= 0:
@@ -374,7 +413,7 @@ def _wheel_candidates(g, expirydt, spot, prev_spot, lower_2sigma, upper_2sigma):
 
     Uses the bid (what a seller actually collects) and each strike's IV to derive
     Black-Scholes delta, probability of expiring OTM, and annualized return on capital.
-    Only the sellable delta band (0.05-0.45) is kept.
+    Only the sellable delta band (0.01-0.45) is kept.
     """
     rows = []
     if spot is None or spot <= 0:
@@ -404,7 +443,7 @@ def _wheel_candidates(g, expirydt, spot, prev_spot, lower_2sigma, upper_2sigma):
         d1 = (math.log(spot / K) + (r + 0.5 * iv * iv) * T) / vs
         delta = _ncdf(d1) - 1.0 if put else _ncdf(d1)
         adelta = abs(delta)
-        if adelta < 0.05 or adelta > 0.45:
+        if adelta < 0.01 or adelta > 0.45:
             continue
         # Today's mark and yesterday's close, kept in the payload (mark not plotted).
         ask = _to_float(row.get("p_Ask" if put else "c_Ask"))
@@ -415,9 +454,11 @@ def _wheel_candidates(g, expirydt, spot, prev_spot, lower_2sigma, upper_2sigma):
         prev_cal = cal_days + 1.0  # one more calendar day to expiry yesterday
         cap_today = K if put else spot
         cap_prev = K if put else (prev_spot if (prev_spot and prev_spot > 0) else spot)
+        pot = _prob_touch(spot, K, T, iv, r)
         rows.append({
             "side": "CSP" if put else "CC", "expiry": expirydt, "strike": K, "dte": dte,
             "delta": round(adelta, 3), "pop": round((1 - adelta) * 100, 1),
+            "pot": round(pot * 100, 1) if pot is not None else None,
             "bid": round(bid, 2),
             "ann_roc": _annual(bid, cap_today, cal_days),
             "ann_roc_mark": _annual(mark, cap_today, cal_days),
@@ -759,7 +800,7 @@ def _fetch_symbol_quote(symbol, assetclass):
     resp.raise_for_status()
     d = (resp.json().get("data") or {}).get("primaryData") or {}
     last = prev = None
-    m = re.findall(r"\d+\.\d+", str(d.get("lastSalePrice", "")))
+    m = re.findall(r"\d+\.\d+", str(d.get("lastSalePrice", "")).replace(",", ""))
     if m:
         last = float(m[0])
     try:
@@ -831,6 +872,113 @@ def get_cached_spot_price(ticker=DEFAULT_TICKER, max_age_seconds=4.0):
         c = {"price": _to_float(tk.lastSalePrice), "status": tk.marketStatus, "ts": time.time()}
         _spot_caches[ticker] = c
         return c["price"], c["status"]
+
+
+# ── Earnings: next report date, EPS surprise history, consensus forecasts ────
+_EARN_TTL = 6 * 3600
+_earn_lock = threading.Lock()
+_earn_caches = {}  # ticker -> {"ts", "payload"}
+
+
+def _nasdaq_json(path):
+    resp = requests.get(f"https://api.nasdaq.com/api/{path}", headers=get_headers(), timeout=15)
+    resp.raise_for_status()
+    return resp.json().get("data") or {}
+
+
+def _fiscal_sort_key(label):
+    try:
+        return datetime.strptime(label.strip(), "%b %Y")
+    except (ValueError, AttributeError):
+        return datetime.max
+
+
+def _event_day(d, timing):
+    """First session that trades on the news: same day if BMO, else the next business day."""
+    return d if timing == "BMO" else pd.Timestamp(np.busday_offset(d.date(), 1, roll="forward")).to_pydatetime()
+
+
+def build_earnings_payload(ticker=DEFAULT_TICKER):
+    ticker = _norm_ticker(ticker)
+    date_d = _nasdaq_json(f"analyst/{ticker}/earnings-date")
+    surprise_d = _nasdaq_json(f"company/{ticker}/earnings-surprise")
+    forecast_d = _nasdaq_json(f"analyst/{ticker}/earnings-forecast")
+
+    text = " ".join(str(date_d.get(k) or "") for k in ("reportText", "announcement"))
+    m = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text)
+    next_dt = datetime.strptime(m.group(1), "%m/%d/%Y") if m else None
+    low = text.lower()
+    confirmed = next_dt is not None and "estimated" not in low
+    timing = "AMC" if "after market close" in low else "BMO" if "before market open" in low else None
+
+    next_info = None
+    if next_dt is not None:
+        # Unconfirmed vendor dates are algorithmic; allow the report a week earlier.
+        earliest = next_dt if confirmed else next_dt - pd.Timedelta(days=7)
+        next_info = {
+            "date": next_dt.strftime("%Y-%m-%d"),
+            "confirmed": confirmed,
+            "timing": timing,
+            "window_start": earliest.strftime("%Y-%m-%d"),
+            "event_day_earliest": _event_day(earliest, timing).strftime("%Y-%m-%d"),
+            "event_day_latest": _event_day(next_dt, timing).strftime("%Y-%m-%d"),
+            "days_to": (next_dt.date() - et_now().date()).days,
+            "text": str(date_d.get("reportText") or "").strip(),
+        }
+
+    history = []
+    for r in ((surprise_d.get("earningsSurpriseTable") or {}).get("rows") or []):
+        try:
+            rep = datetime.strptime(str(r.get("dateReported")), "%m/%d/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            rep = None
+        history.append({
+            "quarter": str(r.get("fiscalQtrEnd") or "").strip(),
+            "reported": rep,
+            "eps": _to_float(r.get("eps")),
+            "consensus": _to_float(r.get("consensusForecast")),
+            "surprise_pct": _to_float(r.get("percentageSurprise")),
+        })
+    history.sort(key=lambda h: _fiscal_sort_key(h["quarter"]))
+
+    def _forecast_rows(block):
+        return [{
+            "period": str(r.get("fiscalEnd") or "").strip(),
+            "consensus": _to_float(r.get("consensusEPSForecast")),
+            "high": _to_float(r.get("highEPSForecast")),
+            "low": _to_float(r.get("lowEPSForecast")),
+            "estimates": _to_float(r.get("noOfEstimates")),
+            "up": _to_float(r.get("up")),
+            "down": _to_float(r.get("down")),
+        } for r in ((forecast_d.get(block) or {}).get("rows") or [])]
+
+    quarterly = sorted(_forecast_rows("quarterlyForecast"), key=lambda q: _fiscal_sort_key(q["period"]))
+    return {
+        "ticker": ticker,
+        "available": bool(next_info or history or quarterly),
+        "next": next_info,
+        "history": history,
+        "quarterly": quarterly,
+        "yearly": _forecast_rows("yearlyForecast"),
+    }
+
+
+def get_cached_earnings(ticker=DEFAULT_TICKER):
+    """Earnings payload refreshed every few hours; serves the last good copy on failure."""
+    ticker = _norm_ticker(ticker)
+    with _earn_lock:
+        entry = _earn_caches.get(ticker)
+        if entry is not None and time.time() - entry["ts"] < _EARN_TTL:
+            return entry["payload"]
+        try:
+            payload = build_earnings_payload(ticker)
+        except Exception:
+            traceback.print_exc()
+            if entry is not None:
+                return entry["payload"]
+            return {"ticker": ticker, "available": False}
+        _earn_caches[ticker] = {"payload": payload, "ts": time.time()}
+        return payload
 
 
 _spy_lock = threading.Lock()

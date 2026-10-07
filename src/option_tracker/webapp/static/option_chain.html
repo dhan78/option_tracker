@@ -22,7 +22,11 @@
   <div class="status-bar" id="status-bar">
     <span class="muted"><span class="spinner"></span>Loading option chain…</span>
   </div>
-  <div id="refresh-label" class="muted"></div>
+  <div id="refresh-label" class="muted">
+    <span id="refresh-countdown"></span>
+    <label class="clock-toggle"><input type="checkbox" id="clock-toggle" /> clock</label>
+    <span id="live-clock"></span>
+  </div>
   <div class="calc-link-row"><a href="#" id="calc-link">Show 2σ &amp; probability of expiring calculations →</a></div>
 
   <div class="content">
@@ -71,14 +75,22 @@
             </details>
           </div>
         </details>
+        <details id="earnings-panel" class="collapsible" open style="display:none">
+          <summary>Earnings <span id="earn-summary" class="muted"></span></summary>
+          <div id="eps-chart" class="chart-box" style="min-height:260px;"></div>
+          <div id="earn-table"></div>
+          <div class="gex-note"><b>● actual</b> vs <b>○ consensus</b> EPS; bars = % surprise (right axis); whiskers = analysts' low–high range for upcoming quarters, ↑/↓ = estimate revisions over the last 4 weeks. EPS is Zacks-adjusted (excludes one-off items). <b>⚡</b> marks the earnings expiry (first to settle after the report); <b>⚡?</b> = only if an unconfirmed date lands early in its window. Later expiries also hold through the report but aren't marked. <b>Event 1σ</b> = the report's own implied move, isolated from the IV term structure (post-event expiry variance − pre-event variance − normal days).</div>
+        </details>
         <details id="wheel-panel" class="collapsible" open>
           <summary>Wheel Scanner <span class="muted" id="wheel-count"></span></summary>
           <div class="wheel-controls">
             Side <select id="w-side"><option value="all">All</option><option value="CSP">CSP · sell puts</option><option value="CC">CC · sell calls</option></select>
             &nbsp;·&nbsp; min PoP <input id="w-pop" type="number" value="0" min="0" max="100" step="5" /> %
-            &nbsp;·&nbsp; DTE <input id="w-mindte" type="number" value="1" min="0" /> – <input id="w-maxdte" type="number" value="60" min="0" />
+            &nbsp;·&nbsp; Expiry <select id="w-expiry"><option value="next">Next expiry</option><option value="range">DTE range</option></select>
+            &nbsp;·&nbsp; DTE <input id="w-mindte" type="number" value="1" min="0" title="min DTE (also sets which expiry counts as 'next')" /> – <input id="w-maxdte" type="number" value="2" min="0" title="max DTE (DTE range mode)" />
+            &nbsp;·&nbsp; <label><input id="w-hide-earn" type="checkbox" /> hide ⚡ earnings expiries</label>
           </div>
-          <div class="wheel-note">Selling OTM cash-secured puts (CSP) &amp; covered calls (CC). Δ ≈ assignment probability · PoP = keep-the-premium odds · <b>Ann ROC</b> = bid ÷ (strike for CSP, spot for CC) annualized by DTE · Breakeven = assigned cost basis (CSP) or effective sale price (CC) · ⚠ = strike beyond the 2σ expected move. Rows shaded near the 0.30 / 0.16 delta targets. Click a header to sort. Per-expiry yield ladders appear beside each expiry row below.</div>
+          <div class="wheel-note">Selling OTM cash-secured puts (CSP) &amp; covered calls (CC). Δ ≈ assignment probability · PoP = keep-the-premium odds · <b>PoT</b> = odds the strike trades at any point before expiry (≈ 2× assignment odds) · <b>Ann ROC</b> = bid ÷ (strike for CSP, spot for CC) annualized by DTE · Breakeven = assigned cost basis (CSP) or effective sale price (CC) · ⚠ = strike beyond the 2σ expected move. ⚡ = earnings expiry (first after the report). Rows shaded near the 0.30 / 0.16 delta targets. Click a header to sort. Per-expiry yield ladders appear beside each expiry row below.</div>
           <div class="calc-link-row"><a href="#" id="ladder-help-link">How to read the yield ladder (ann ROC%) →</a></div>
           <div id="wheel-table"></div>
         </details>
